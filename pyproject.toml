@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-sr"
+version = "0.1.0"
+description = "Simulation prototype: MLX90640 multi-frame super-resolution from small natural motion"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "scikit-image>=0.22",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["mlx_sr"]
+
+[tool.pytest.ini_options]
+# pythonpath lets worktrees share one third-party venv without an editable install.
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = ["slow: long-running tests (benchmark smoke runs); deselected by default, run with -m slow"]
+# Slow tests are deselected by default; a later `-m` on the command line overrides this.
+addopts = "-m \"not slow\""
