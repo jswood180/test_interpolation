@@ -26,7 +26,7 @@ from mlx_sr.types import Roi, SensorConfig
 
 def _synthetic_edge(rows: int, cols: int, scale: int, sigma: float, angle_deg: float, *,
                     supersample: int = 1, hot_right: bool = True, low: float = 25.0,
-                    high: float = 35.0) -> np.ndarray:
+                    high: float = 35.0, center: tuple[float, float] | None = None) -> np.ndarray:
     """Analytic Gaussian-blurred straight edge on a scale-``scale`` grid.
 
     The edge line is ``x = cx + (y - cy) tan(angle)`` in LR px; the profile
@@ -34,8 +34,7 @@ def _synthetic_edge(rows: int, cols: int, scale: int, sigma: float, angle_deg: f
     ``supersample=1`` point-samples at pixel centers (no aperture);
     ``supersample=n`` averages an n x n grid per pixel (a box pixel aperture).
     """
-    cx = cols / scale / 2.0 + 0.13
-    cy = rows / scale / 2.0
+    cx, cy = (cols / scale / 2.0 + 0.13, rows / scale / 2.0) if center is None else center
     th = math.radians(angle_deg)
     off = (np.arange(supersample) + 0.5) / supersample
     ys = (np.arange(rows)[:, None] + off[None, :]).ravel() / scale
@@ -106,6 +105,43 @@ def test_m1_orientation_and_polarity(variant):
     assert np.abs(r["mtf"][sel] - _expected_mtf(f[sel], sigma, angle, None)).max() < 0.03
 
 
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("aperture", ["point", "pixel"])
+@pytest.mark.parametrize("sigma", [0.5, 0.8])
+def test_m1_on_chart_edge_roi_geometry(scale, aperture, sigma):
+    """M1 on the chart's own (short) edge ROI, where windowing matters most."""
+    edge = make_scene("chart").meta.edge
+    img = _synthetic_edge(24 * scale, 32 * scale, scale, sigma, edge.angle_deg,
+                          supersample=1 if aperture == "point" else 16, center=edge.center)
+    r = slanted_edge_mtf(img, edge.roi, scale)
+    assert r["valid"] and not r["truncated"]
+    f = r["freq"]
+    sel = f <= 0.5 + 1e-12
+    expected = _expected_mtf(f[sel], sigma, edge.angle_deg, None if aperture == "point" else 1.0 / scale)
+    err = np.abs(r["mtf"][sel] - expected).max()
+    assert err < 0.03, f"max |MTF - expected| = {err:.4f}"
+
+
+def test_m1_short_side_is_flagged():
+    """An edge 2 LR px from the ROI boundary with a wide LSF is flagged ``truncated``."""
+    edge = make_scene("chart").meta.edge
+    img = _synthetic_edge(48, 64, 2, 1.2, edge.angle_deg, center=(4.0, edge.center[1]))
+    r = slanted_edge_mtf(img, edge.roi, 2)
+    assert r["valid"] and r["truncated"]
+
+
+def test_m1_infinite_pixel_is_ignored():
+    sigma, angle, scale = 0.5, 7.0, 2
+    img = _synthetic_edge(48, 48, scale, sigma, angle)
+    ref = slanted_edge_mtf(img, Roi(0.0, 0.0, 24.0, 24.0), scale)
+    for bad in (np.inf, -np.inf):
+        im = img.copy()
+        im[10, 30] = bad
+        r = slanted_edge_mtf(im, Roi(0.0, 0.0, 24.0, 24.0), scale)
+        assert r["valid"]
+        assert r["mtf_at"](0.5) == pytest.approx(ref["mtf_at"](0.5), abs=0.01)
+
+
 def test_m1_noisy_edge_stays_close(rng):
     """Moderate noise (SNR 100 on the step) keeps the MTF within 0.05."""
     sigma, angle, scale = 0.5, 7.0, 2
@@ -165,13 +201,21 @@ def test_m2_nan_and_tiny_inputs(rng):
     assert math.isnan(psnr(np.full((4, 4), np.nan), a[:4, :4]))
     with pytest.raises(ValueError):
         ssim(a, a[:-1])
+    # "propagate" makes holes count instead of silently dropping them.
+    assert math.isnan(psnr(bn, a, data_range=10.0, nan_policy="propagate"))
+    assert math.isnan(ssim(bn, a, data_range=10.0, nan_policy="propagate"))
+    assert psnr(b, a, data_range=10.0, nan_policy="propagate") == pytest.approx(ref_psnr)
+    with pytest.raises(ValueError):
+        psnr(b, a, nan_policy="raise")
+    # Even window sizes round down to odd instead of raising.
+    assert ssim(b, a, data_range=10.0, win_size=6) == pytest.approx(ssim(b, a, data_range=10.0, win_size=5))
 
 
 # M3 ------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("scale", [2, 4])
-@pytest.mark.parametrize("blur_lr", [0.3, 0.5])
+@pytest.mark.parametrize("blur_lr", [0.3, 0.5, 0.6])
 def test_m3_bar_contrast_falls_with_frequency(scale, blur_lr):
     scene = make_scene("bars")
     hr = ndimage.gaussian_filter(scene.hr, blur_lr * scene.hr_factor, mode="nearest")
@@ -183,7 +227,11 @@ def test_m3_bar_contrast_falls_with_frequency(scale, blur_lr):
     assert np.all(np.isfinite(c)) and np.all(np.isfinite(m))
     assert np.all(np.diff(c) < 0), f"contrast not monotone: {np.round(c, 3)}"
     assert np.all(np.diff(m) < 0), f"modulation not monotone: {np.round(m, 3)}"
-    assert c[0] > 0.8 and c[-1] < c[0]
+    assert c[0] > (0.8 if blur_lr <= 0.5 else 0.7) and c[-1] < c[0]
+    # A DC offset (FPN, bias) does not change the contrast; Michelson is reported too.
+    shifted = bar_contrast(img - 2.0, scene.meta.bars, scale)
+    np.testing.assert_allclose(shifted["contrast"], res["contrast"], atol=1e-12)
+    assert np.all(np.isfinite(res["michelson"]))
 
 
 def test_m3_heavy_blur_limits_resolution():
@@ -274,7 +322,7 @@ def test_all_metrics_on_chart_truth_at_scale_2(chart_capture):
     exp_ = np.ones_like(f)
     for p in (0.5, 1.0 / 8.0):
         exp_ *= np.sinc(p * f * math.cos(th)) * np.sinc(p * f * math.sin(th))
-    assert np.abs(r["mtf"][: f.size] - exp_).max() < 0.05
+    assert np.abs(r["mtf"][: f.size] - exp_).max() < 0.03
     assert r["mtf50"] > 0.5  # sharper than native Nyquist on a 2x truth
 
     bars = bar_contrast(t, meta.bars, 2)

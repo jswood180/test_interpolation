@@ -49,7 +49,7 @@ MTF_OVERSAMPLE: int = 4
 """ESF bins per target-grid pixel pitch (ISO 12233 uses 4x)."""
 
 BAR_CONTRAST_THRESHOLD: float = 0.1
-"""Minimum Michelson contrast for a bar group to count as resolved."""
+"""Minimum bar contrast (``(I_max - I_min) / (high - low)``) for a group to count as resolved."""
 
 
 # ---------------------------------------------------------------------------
@@ -87,20 +87,30 @@ def _shift_xy(shift) -> tuple[float, float]:
 # ---------------------------------------------------------------------------
 
 
-def psnr(img: np.ndarray, ref: np.ndarray, *, data_range: float | None = None, border: int = 0) -> float:
+def _check_nan_policy(nan_policy: str) -> None:
+    if nan_policy not in ("omit", "propagate"):
+        raise ValueError(f"nan_policy must be 'omit' or 'propagate', not {nan_policy!r}")
+
+
+def psnr(img: np.ndarray, ref: np.ndarray, *, data_range: float | None = None, border: int = 0,
+         nan_policy: str = "omit") -> float:
     """PSNR in dB.  ``data_range`` defaults to ``ref.max() - ref.min()`` (after
     cropping ``border`` pixels).  Identical images give ``inf``.
 
-    Pixels where either image is non-finite are excluded; NaN if none remain.
-    Pass an explicit ``data_range`` when comparing methods so the score does
-    not depend on the reference's extremes.
+    ``nan_policy="omit"`` (default) excludes pixels where either image is
+    non-finite (NaN if none remain); ``"propagate"`` returns NaN if any pixel
+    is non-finite.  "omit" does not penalize holes, so when comparing methods
+    check that reconstructions are finite (or use "propagate").  Pass an
+    explicit ``data_range`` when comparing methods so the score does not
+    depend on the reference's extremes.
     """
+    _check_nan_policy(nan_policy)
     a = _crop(np.asarray(img, float), border)
     b = _crop(np.asarray(ref, float), border)
     if a.shape != b.shape:
         raise ValueError(f"shape mismatch {a.shape} vs {b.shape}")
     ok = np.isfinite(a) & np.isfinite(b)
-    if not ok.any():
+    if not ok.any() or (nan_policy == "propagate" and not ok.all()):
         return float("nan")
     a, b = a[ok], b[ok]
     dr = float(b.max() - b.min()) if data_range is None else float(data_range)
@@ -113,15 +123,18 @@ def psnr(img: np.ndarray, ref: np.ndarray, *, data_range: float | None = None, b
 
 
 def ssim(img: np.ndarray, ref: np.ndarray, *, data_range: float | None = None, border: int = 0,
-         win_size: int | None = None) -> float:
+         win_size: int | None = None, nan_policy: str = "omit") -> float:
     """Mean SSIM (scikit-image, uniform window, default constants).
 
     ``data_range`` defaults to the cropped reference's range (pass it
     explicitly when comparing methods).  ``win_size`` defaults to 7 and is
-    reduced to the largest odd size that fits tiny images (minimum 3).
-    Windows touching a non-finite pixel in either image are excluded from the
-    mean; NaN if no window is valid.  Identical finite images give 1.
+    rounded down to an odd size and reduced to fit tiny images (minimum 3).
+    With ``nan_policy="omit"`` (default) windows touching a non-finite pixel
+    in either image are excluded from the mean (NaN if no window is valid);
+    ``"propagate"`` returns NaN if any pixel is non-finite.  Identical finite
+    images give 1.
     """
+    _check_nan_policy(nan_policy)
     from skimage.metrics import structural_similarity
 
     a = _crop(np.asarray(img, float), border)
@@ -131,13 +144,14 @@ def ssim(img: np.ndarray, ref: np.ndarray, *, data_range: float | None = None, b
     if a.ndim != 2:
         raise ValueError(f"expected 2-D images, got shape {a.shape}")
     bad = ~(np.isfinite(a) & np.isfinite(b))
-    if bad.all():
+    if bad.all() or (nan_policy == "propagate" and bad.any()):
         return float("nan")
     dr = float(np.max(b[~bad]) - np.min(b[~bad])) if data_range is None else float(data_range)
     if dr <= 0.0:
         return 1.0 if np.array_equal(a[~bad], b[~bad]) else float("nan")
     w = 7 if win_size is None else int(win_size)
-    w = min(w, min(a.shape) if min(a.shape) % 2 == 1 else min(a.shape) - 1)
+    w = min(w, min(a.shape))
+    w -= int(w % 2 == 0)
     if w < 3:
         return float("nan")
     a = np.where(bad, 0.0, a)
@@ -175,7 +189,8 @@ def _nan_mtf(reason: str, scale: float) -> dict:
     return {"freq": f, "freqs": f, "mtf": np.zeros(0), "mtf50": float("nan"), "mtf_at": mtf_at,
             "nyquist": 0.5 * scale, "angle_deg": float("nan"), "esf": np.zeros(0),
             "esf_x": np.zeros(0), "lsf": np.zeros(0), "n_lines": 0, "phase_cycles": float("nan"),
-            "transposed": False, "valid": False, "reason": reason}
+            "transposed": False, "lsf_rms": float("nan"), "truncated": False,
+            "valid": False, "reason": reason}
 
 
 def _first_crossing(f: np.ndarray, m: np.ndarray, level: float) -> float:
@@ -220,8 +235,8 @@ def slanted_edge_mtf(img: np.ndarray, roi: Roi, scale: int = 1, shift=(0.0, 0.0)
     the second Hann-windowed around the first fit); least-squares line fit;
     project every pixel center onto the edge normal; bin the ESF at
     ``1 / (oversample * scale)`` LR px; differentiate (central difference),
-    apply a Hann window centered on the edge and spanning the largest
-    symmetric ESF extent; FFT; normalize to 1 at DC.  The MTF is divided by
+    apply a window centered on the edge that is flat over the inner half of
+    each side of the occupied ESF and Hann-tapered over the outer half; FFT; normalize to 1 at DC.  The MTF is divided by
     the transfer functions of the central difference (``sinc(2 f h)``) and of
     the bin averaging (``sinc(f h)``), ``h`` being the bin width, so a
     perfect estimator returns the image's MTF.
@@ -238,7 +253,10 @@ def slanted_edge_mtf(img: np.ndarray, roi: Roi, scale: int = 1, shift=(0.0, 0.0)
     edge), ``esf_x``/``esf``/``lsf`` (binned, LR px), ``n_lines``,
     ``phase_cycles`` (edge drift across the lines in target pixels; below
     about 1 the oversampled ESF has gaps, filled by interpolation, and the
-    MTF is less reliable), ``transposed`` and ``valid``/``reason``.  Use a
+    MTF is less reliable), ``transposed``, ``lsf_rms`` (RMS half-width of the
+    windowed LSF, LR px), ``truncated`` (the ESF on the shorter side of the
+    edge spans under 3 ``lsf_rms``: the MTF may be biased high; use a wider
+    ROI) and ``valid``/``reason``.  Use a
     slant of a few degrees (the chart uses 7).  ``f_max`` is capped at
     ``scale * oversample / 4``.  Degenerate input (too small, no edge, all NaN)
     returns ``valid=False`` with NaN results instead of raising.
@@ -256,7 +274,7 @@ def slanted_edge_mtf(img: np.ndarray, roi: Roi, scale: int = 1, shift=(0.0, 0.0)
     if finite.sum() < 8:
         return _nan_mtf("too few finite pixels", s)
     # Orientation from the mean absolute gradient.
-    z0 = np.where(finite, patch, np.nanmean(patch))
+    z0 = np.where(finite, patch, float(np.mean(patch[finite])))
     gx = np.nanmean(np.abs(np.diff(z0, axis=1)))
     gy = np.nanmean(np.abs(np.diff(z0, axis=0)))
     transposed = bool(gy > gx)
@@ -272,7 +290,7 @@ def slanted_edge_mtf(img: np.ndarray, roi: Roi, scale: int = 1, shift=(0.0, 0.0)
         return _nan_mtf("too few complete lines", s)
     z = patch[full]
     yl = ys[full]
-    step = float(np.nanmax(patch) - np.nanmin(patch))
+    step = float(np.max(patch[finite]) - np.min(patch[finite]))
     if not step > 0:
         return _nan_mtf("no edge contrast", s)
 
@@ -316,19 +334,27 @@ def slanted_edge_mtf(img: np.ndarray, roi: Roi, scale: int = 1, shift=(0.0, 0.0)
     if filled.sum() < 8:
         return _nan_mtf("too few ESF bins", s)
     esf = np.interp(centers, centers[filled], tot[filled] / np.maximum(cnt[filled], 1))
-    # Trim to the occupied range, then to the largest range symmetric about the edge.
+    # Trim to the occupied range.
     first, last = np.nonzero(filled)[0][[0, -1]]
     centers, esf = centers[first:last + 1], esf[first:last + 1]
-    R = min(-centers[0], centers[-1])
-    if R < 2.0 * h * 2:
+    left, right = -centers[0], centers[-1]
+    if min(left, right) < 4.0 * h:
         return _nan_mtf("edge too close to the roi boundary", s)
-    sym = np.abs(centers) <= R
-    centers, esf = centers[sym], esf[sym]
 
     lsf = np.gradient(esf)  # central difference over 2 bins
-    n = lsf.size
-    win = 0.5 * (1.0 + np.cos(np.pi * centers / (R + h)))
+    # Window: flat over the inner half of each side, Hann tapers over the
+    # outer half (an asymmetric Tukey window centered on the edge).  A full
+    # Hann over a short ESF narrows the LSF and inflates the MTF.
+    win = np.ones_like(centers)
+    for side, ext in ((centers < 0, left), (centers > 0, right)):
+        u = (np.abs(centers[side]) - 0.5 * ext) / (0.5 * ext + h)
+        win[side] = np.where(u > 0, 0.5 * (1.0 + np.cos(np.pi * np.clip(u, 0.0, 1.0))), 1.0)
     lsfw = lsf * win
+    n = lsf.size
+    # RMS half-width of the windowed LSF, to flag ROIs too short for it.
+    wl = np.abs(lsfw)
+    lsf_rms = float(np.sqrt(np.sum(wl * centers ** 2) / np.sum(wl))) if wl.sum() > 0 else float("nan")
+    truncated = bool(not np.isfinite(lsf_rms) or min(left, right) < 3.0 * lsf_rms)
     nfft = int(2 ** math.ceil(math.log2(max(n, 1) * 4)))
     nfft = max(nfft, 1024)
     spec = np.abs(np.fft.rfft(lsfw, nfft))
@@ -358,7 +384,7 @@ def slanted_edge_mtf(img: np.ndarray, roi: Roi, scale: int = 1, shift=(0.0, 0.0)
     return {"freq": freq, "freqs": freq, "mtf": mtf, "mtf50": mtf50, "mtf_at": mtf_at,
             "nyquist": 0.5 * s, "angle_deg": angle, "esf_x": centers, "esf": esf, "lsf": lsf,
             "n_lines": n_lines, "phase_cycles": phase_cycles, "transposed": transposed,
-            "valid": True, "reason": ""}
+            "lsf_rms": lsf_rms, "truncated": truncated, "valid": True, "reason": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -401,9 +427,10 @@ def _bar_group_contrast(img: np.ndarray, g: BarGroup, scale: float, shift,
     nan = float("nan")
     pos, prof = _bar_profile(img, g, scale, shift)
     span = g.high_c - g.low_c
-    out = {"freq": g.freq_cyc_per_lr, "period": g.period_lr, "contrast": nan, "modulation": nan,
-           "i_max": nan, "i_min": nan, "ordered": False, "min_dip_contrast": nan, "above_nyquist": g.freq_cyc_per_lr > 0.5 * scale,
-           "resolvable": False, "n_samples": int(pos.size)}
+    out = {"freq": g.freq_cyc_per_lr, "period": g.period_lr, "contrast": nan, "michelson": nan,
+           "modulation": nan, "i_max": nan, "i_min": nan, "ordered": False, "min_dip_contrast": nan,
+           "above_nyquist": g.freq_cyc_per_lr > 0.5 * scale, "resolvable": False,
+           "n_samples": int(pos.size)}
     if pos.size < 2 or span == 0:
         return out
     p = g.period_lr
@@ -426,72 +453,87 @@ def _bar_group_contrast(img: np.ndarray, g: BarGroup, scale: float, shift,
     if not (np.isfinite(hot).any() and np.isfinite(cold).any()):
         return out
     nmax, nmin = float(np.nanmean(hot)), float(np.nanmean(cold))
+    # Primary contrast: (I_max - I_min) / (high - low), offset-invariant.
+    contrast = nmax - nmin
     den = nmax + nmin
-    contrast = (nmax - nmin) / den if den > 0 else nan
+    michelson = (nmax - nmin) / den if den > 0 else nan
     # Every interior cold bar must sit below both neighboring hot bars.
     ordered = bool(all(np.isfinite(cold[k]) and np.isfinite(hot[k]) and np.isfinite(hot[k + 1])
                        and cold[k] < hot[k] and cold[k] < hot[k + 1] for k in range(g.n_cycles - 1)))
     # Fundamental amplitude at the bar frequency over the group extent, as a
-    # fraction of an ideal square wave's fundamental (4/pi * span/2).
+    # fraction of an ideal square wave's fundamental (4/pi * span/2).  A
+    # quadratic envelope is fitted jointly so the group's overall bump (a
+    # heavily blurred group still sits above the background) does not leak in.
     m = (pos >= start) & (pos < start + g.n_cycles * p)
     modulation = nan
-    if m.sum() >= 3:
-        modulation = _sine_amplitude(pos[m] - start, n[m], g.freq_cyc_per_lr) / (2.0 / np.pi)
-    # Local Michelson contrast of each interior dip against its weaker neighbor.
+    if m.sum() >= 6:
+        modulation = _sine_amplitude(pos[m] - start, n[m], g.freq_cyc_per_lr,
+                                     g.n_cycles * p) / (2.0 / np.pi)
+    # Local contrast of each interior dip against its weaker neighbor.
     dips = np.full(g.n_cycles - 1, np.nan)
     for k in range(g.n_cycles - 1):
-        pk = min(hot[k], hot[k + 1])
-        if np.isfinite(pk) and np.isfinite(cold[k]) and pk + cold[k] > 0:
-            dips[k] = (pk - cold[k]) / (pk + cold[k])
-    min_dip = float(np.min(dips)) if np.isfinite(dips).all() and dips.size else nan
-    out.update(contrast=float(contrast), modulation=float(modulation), min_dip_contrast=min_dip,
-               i_max=g.low_c + nmax * span, i_min=g.low_c + nmin * span, ordered=ordered)
+        dips[k] = min(hot[k], hot[k + 1]) - cold[k]
+    min_dip = float(np.min(dips)) if dips.size and np.isfinite(dips).all() else nan
+    out.update(contrast=float(contrast), michelson=float(michelson), modulation=float(modulation),
+               min_dip_contrast=min_dip, i_max=g.low_c + nmax * span, i_min=g.low_c + nmin * span,
+               ordered=ordered)
     out["resolvable"] = bool(np.isfinite(contrast) and contrast >= threshold and ordered
                              and np.isfinite(min_dip) and min_dip >= threshold
                              and not out["above_nyquist"])
     return out
 
 
-def _sine_amplitude(x: np.ndarray, y: np.ndarray, f: float) -> float:
-    """Least-squares amplitude of ``a + b cos(2 pi f x) + c sin(2 pi f x)``."""
+def _sine_amplitude(x: np.ndarray, y: np.ndarray, f: float, length: float) -> float:
+    """Least-squares amplitude of ``b cos(2 pi f x) + c sin(2 pi f x)`` fitted
+    jointly with a quadratic envelope in ``x / length``."""
     ph = 2.0 * np.pi * f * x
-    A = np.column_stack([np.ones(x.size), np.cos(ph), np.sin(ph)])
+    u = x / length - 0.5
+    A = np.column_stack([np.ones(x.size), np.cos(ph), np.sin(ph), u, u * u])
     coef, *_ = np.linalg.lstsq(A, y, rcond=None)
     return float(np.hypot(coef[1], coef[2]))
 
 
 def bar_contrast(img: np.ndarray, bar_specs: list[BarGroup], scale: int = 1, shift=(0.0, 0.0), *,
                  threshold: float = BAR_CONTRAST_THRESHOLD) -> dict:
-    """Michelson contrast of each bar group and the limiting resolvable group.
+    """Bar-group contrast and the limiting resolvable group.
 
-    For each group the image is averaged along the bars (inset 1 LR px from
-    the bar ends) and normalized so the group's true low/high levels map to
-    0/1.  ``I_max`` is the mean over hot bars of each bar's maximum,
-    ``I_min`` the mean over the interior cold bars (between hot bars) of each
-    bar's minimum, and the contrast is ``(I_max - I_min) / (I_max + I_min)``
-    on the normalized scale: 1 for perfect bars, 0 for a uniform gray, and
-    about the contrast-transfer value for blurred bars.  (Michelson contrast
-    of raw degrees C would depend on the temperature offset.)
+    For each group the image is averaged along the bars (inset by
+    ``min(1, length/4)`` LR px from the bar ends) and normalized so the
+    group's true low/high levels map to 0/1.  ``I_max`` is the mean over hot
+    bars of each bar's maximum and ``I_min`` the mean over the interior cold
+    bars (between hot bars; the last cold bar merges with the background) of
+    each bar's minimum.
 
-    A group is ``resolvable`` when its contrast >= ``threshold`` and every
-    bar is individually distinguishable: each interior cold bar's local
-    Michelson contrast against its weaker neighboring hot bar
-    (``min_dip_contrast``) is also >= ``threshold`` (which implies
-    ``ordered``), and the bar frequency does not exceed the image grid's
-    Nyquist (``0.5 * scale``), where any "contrast" would be aliasing.  Note
-    that interpolators leak spectral images: a bicubic upscale of LR data
-    carries some correctly phased energy above the native Nyquist (the image
-    of the alias), so bar groups slightly above 0.5 cyc/LR px can
-    occasionally pass on a noisy baseline; average over seeds.  The limiting group is the
+    ``contrast`` (the primary value, used for resolvability) is
+    ``I_max - I_min`` on that scale, i.e. ``(I_max - I_min) / (high - low)``:
+    the contrast transfer, 1 for perfect bars and 0 for uniform gray.  It
+    equals the Michelson contrast ``(I_max - I_min) / (I_max + I_min)`` on the
+    normalized scale whenever the bar mean is preserved (``I_max + I_min =
+    1``), and unlike Michelson it does not change when the image has a DC
+    offset (FPN, bias), which would otherwise move the denominator.  The
+    Michelson value is reported as ``michelson`` (Michelson of raw degrees C
+    is meaningless because it depends on the temperature zero).
+
+    A group is ``resolvable`` when ``contrast >= threshold`` and every bar is
+    individually distinguishable: each interior cold bar's dip below its
+    weaker neighboring hot bar (``min_dip_contrast``, same units) is also
+    ``>= threshold`` (which implies ``ordered``), and the bar frequency does
+    not exceed the image grid's Nyquist (``0.5 * scale``), where any
+    "contrast" would be aliasing.  The limiting group is the
     highest-frequency group reached, in order of increasing frequency,
     before the first unresolvable one (so spurious contrast above the limit
-    does not count).
+    does not count).  Interpolators leak spectral images: a bicubic upscale
+    of LR data carries some correctly phased energy above the native Nyquist
+    (the image of the alias), so on noisy baselines groups just above
+    0.5 cyc/LR px could occasionally pass; average over seeds.
 
     Returns a dict: ``groups`` (per-group dicts in input order with
-    ``freq``, ``period``, ``contrast``, ``modulation`` (fundamental
-    amplitude relative to an ideal square wave), ``i_max``/``i_min`` (deg C),
-    ``ordered``, ``min_dip_contrast``, ``above_nyquist``, ``resolvable``, ``n_samples``), arrays
-    ``freq``, ``contrast``, ``modulation``, ``resolvable`` (input order),
+    ``freq``, ``period``, ``contrast``, ``michelson``, ``modulation``
+    (fundamental amplitude relative to an ideal square wave, fitted with a
+    quadratic envelope; NaN with fewer than 6 samples), ``i_max``/``i_min``
+    (deg C), ``ordered``, ``min_dip_contrast``, ``above_nyquist``,
+    ``resolvable``, ``n_samples``), arrays ``freq``, ``contrast``,
+    ``michelson``, ``modulation``, ``resolvable`` (input order),
     ``limit_index`` (index into ``bar_specs`` or None), ``limit_freq`` and
     ``limit_period`` (NaN if none) and ``threshold``.
     """
@@ -508,6 +550,7 @@ def bar_contrast(img: np.ndarray, bar_specs: list[BarGroup], scale: int = 1, shi
         "groups": groups,
         "freq": freq,
         "contrast": np.array([g["contrast"] for g in groups], dtype=float),
+        "michelson": np.array([g["michelson"] for g in groups], dtype=float),
         "modulation": np.array([g["modulation"] for g in groups], dtype=float),
         "resolvable": res,
         "limit_index": limit,
