@@ -6,7 +6,7 @@ tables) and PNG plots to ``docs/results/`` (or ``--out``).
 Usage::
 
     python scripts/run_benchmark.py            # full sweep (all cores)
-    python scripts/run_benchmark.py --quick    # smoke run, well under 2 minutes
+    python scripts/run_benchmark.py --quick    # smoke run (seconds), written to a new temp directory
     python scripts/run_benchmark.py --jobs 4 --seeds 3 --out /tmp/res
 
 Sweeps (see ``build_cases``):
@@ -33,6 +33,12 @@ Sweeps (see ``build_cases``):
 ``reg``
     Registration RMS of gyro / phase / gn / hybrid versus scene contrast
     (textured scene, 0.3-10 K RMS).
+``exposure``
+    Full versus staggered per-pixel exposure timing (an unsourced
+    assumption either way) for natural tremor and wobble.
+
+Every reconstruction case also runs a still twin and a no-spread twin
+(:func:`mlx_sr.pipeline.run_case`).  All cases use 4 dead pixels.
 """
 
 from __future__ import annotations
@@ -76,6 +82,8 @@ TREMOR_ORDER = ["t0.05", "t0.1", "t0.3", "t1", "t3"]
 WOBBLE_ORDER = ["wob1_0.5hz", "wob2_1hz", "wob2_2hz"]
 
 BASELINES = ("bicubic", "bicubic_single", "average", "nc", "ibp")
+N_DEAD = 4  # datasheet allows up to 4 defective pixels; the benchmark uses the worst case
+EXPOSURE_MOTIONS = ["t0.1_nodrift", "t0.1", "t0.3", "wob1_0.5hz", "wob2_1hz"]
 ORACLE = ("btv", "average", "ibp")
 STILL = ("btv", "ibp", "average")
 
@@ -89,7 +97,7 @@ def build_cases(quick: bool, seeds: int | None) -> list[dict]:
     def add(sweep, n, **kw):
         base = dict(sweep=sweep, scene="chart", variant="BAB", motion="t0.3", refresh_hz=8.0,
                     n_frames=8, psf_sigma_px=0.4, psf_assumed=None, scale=2, contrast_k=None,
-                    image_only=False)
+                    image_only=False, exposure="full", n_dead=N_DEAD)
         base.update(kw)
         for seed in range(n):
             cases.append(dict(base, seed=1000 + seed))
@@ -109,6 +117,8 @@ def build_cases(quick: bool, seeds: int | None) -> list[dict]:
             add("psf", n_seed_side, variant="BAB", motion="wob2_1hz", psf_sigma_px=ps, psf_assumed=0.4)
         for c in (1.0, 10.0):
             add("reg", n_seed_side, scene="textured", variant="BAB", motion="wob2_1hz", contrast_k=c)
+        for e in ("full", "staggered"):
+            add("exposure", n_seed_side, variant="BAB", motion="t0.3", exposure=e)
         return cases
 
     for scene in ("chart", "people", "textured"):
@@ -128,6 +138,10 @@ def build_cases(quick: bool, seeds: int | None) -> list[dict]:
     for m in ("t0.3", "wob2_1hz"):
         for c in (0.3, 1.0, 3.0, 10.0):
             add("reg", n_seed, scene="textured", variant="BAB", motion=m, contrast_k=c)
+    for v in variants:
+        for m in EXPOSURE_MOTIONS:
+            for e in ("full", "staggered"):
+                add("exposure", n_seed_side, variant=v, motion=m, exposure=e)
     return cases
 
 
@@ -150,7 +164,8 @@ def _sensor(case: dict):
     from mlx_sr.types import SensorConfig
 
     make = SensorConfig.bab if case["variant"] == "BAB" else SensorConfig.baa
-    return make(refresh_hz=case["refresh_hz"], psf_sigma_px=case["psf_sigma_px"])
+    return make(refresh_hz=case["refresh_hz"], psf_sigma_px=case["psf_sigma_px"],
+                exposure=case.get("exposure", "full"), n_dead=case.get("n_dead", N_DEAD))
 
 
 def run_one(case: dict) -> dict:
@@ -192,6 +207,7 @@ def run_one(case: dict) -> dict:
                    baselines=BASELINES if central else ("bicubic", "average"),
                    oracle=ORACLE if central else ("btv",),
                    still_control=STILL if central else ("btv",),
+                   nospread_control=("btv",),
                    recon_kw=recon_kw, keep_curves=central)
     row.update(flatten_result(res))
     if central:
@@ -213,6 +229,7 @@ def run_one(case: dict) -> dict:
         row["reg_gn.rms_px"] = alt["registration"]["rms_px"]
         row["gn_minus_hybrid_db"] = row["btv@gn.psnr"] - row["btv.psnr"]
     row["btv_minus_average_db"] = row["btv.psnr"] - row["average.psnr"]
+    row["average_minus_bicubic_db"] = row["average.psnr"] - row["bicubic.psnr"]
     row["time.total_s"] = time.perf_counter() - t0
     return row
 
@@ -295,20 +312,59 @@ class _Col(list):
         return np.asarray(self, dtype=float)
 
 
-def write_csv(rows: list[dict], path: Path) -> None:
+CSV_METRICS = ("psnr", "hf_fidelity")
+"""Per-reconstruction metrics kept in the compact ``results.csv`` for every reconstruction."""
+
+CSV_MAIN = ("bicubic", "average", "btv")
+CSV_MAIN_METRICS = ("ssim", "mtf50", "mtf_at_0.6", "mtf_at_0.75", "bar_limit_freq", "flat_sigma_k")
+"""Extra metrics kept for the main reconstructions only."""
+
+
+def _compact_column(c: str) -> bool:
+    if c.startswith("curve."):
+        return False
+    if "." not in c:
+        return c not in ("motion_label", "image_only")  # case parameters, diagnostics, summary values
+    head, tail = c.split(".", 1)
+    if head == "time":
+        return tail in ("total_s", "btv", "register_s")
+    if head.startswith("reg"):
+        return tail in ("rms_px", "n_fallback")
+    return tail in CSV_METRICS or (head in CSV_MAIN and tail in CSV_MAIN_METRICS)
+
+
+def _csv_value(v):
+    if isinstance(v, (float, np.floating)):
+        return "" if not np.isfinite(v) else f"{v:.4g}"
+    return v
+
+
+def write_csv(rows: list[dict], path: Path, compact: bool = True) -> None:
+    """One row per case.  ``compact`` keeps the case parameters, summary
+    values, registration errors and :data:`CSV_METRICS` per reconstruction
+    (the full set, including hot-spot errors, bar contrasts and timings, is
+    written by ``--full-csv``); MTF curve samples are never written."""
     import csv
 
     fr = Frame(rows)
-    cols = [c for c in fr.columns if not c.startswith("curve.")]
+    cols = [c for c in fr.columns if (_compact_column(c) if compact else not c.startswith("curve."))]
+    keep = set(cols)
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         for r in rows:
-            w.writerow({k: (f"{v:.6g}" if isinstance(v, float) else v) for k, v in r.items()
-                        if not k.startswith("curve.")})
+            w.writerow({k: _csv_value(v) for k, v in r.items() if k in keep})
 
 
-SUMMARY_MOTIONS = ["t0.1", "t0.1_nodrift", "t0.3", "t1", "wob1_0.5hz", "wob2_1hz", "wob2_2hz"]
+SUMMARY_MOTIONS = ["t0.1_nodrift", "t0.1", "t0.3", "t1", "wob1_0.5hz", "wob2_1hz", "wob2_2hz"]
+
+KNOWN_NOTE = ("BTV is given the true PSF σ (except in the PSF sweep), NETD and FPN σ, and its "
+              "regularization defaults were tuned on the chart scene.")
+
+
+def _motions(sub: Frame, order: list[str]) -> list[str]:
+    present = sub.unique("motion")
+    return [m for m in order if m in present]
 
 
 def summary_table(fr: Frame) -> list[str]:
@@ -317,28 +373,31 @@ def summary_table(fr: Frame) -> list[str]:
     if not len(c):
         return []
     out = ["## Summary\n",
-           "Key columns of the central sweep (K = 16 at 8 Hz, 2x, hybrid registration).  "
-           "`BTV - avg` = PSNR(BTV) - PSNR(registered average); `motion dB` = PSNR(BTV) - "
-           "PSNR(BTV still), the part of the BTV result the motion itself buys; `oracle gap` = "
-           "PSNR(BTV, true shifts) - PSNR(BTV); `gn - hybrid` = PSNR(BTV, image-only registration) "
-           "- PSNR(BTV, hybrid); `HF` = high-band fidelity (n/a: the scene has no detail above "
-           "native Nyquist); `gain` = MTF50(BTV) / MTF50(bicubic) (chart only).\n"]
+           "Key columns of the central sweep (K = 16 at 8 Hz, 2x, hybrid registration, full-exposure "
+           "model).  " + KNOWN_NOTE + "  PSNR in dB.  Controls: `still` = the same BTV on a twin "
+           "capture with the same seed, noise and fixed pattern but no motion; `no-spread` = a twin "
+           "with the same within-exposure motion (blur) but the subpage-to-subpage motion removed.  "
+           "`motion dB` = BTV - still and `ΔHF still` = HF(BTV) - HF(still): the total effect of the "
+           "motion.  `spread dB` = BTV - no-spread and `ΔHF spread` = HF(BTV) - HF(no-spread): the "
+           "effect of the sub-pixel spread between subpages alone, i.e. the part that can be "
+           "super-resolution.  `HF` = high-band fidelity (detail above native Nyquist; meaningful "
+           "only as a difference between reconstructions of the same scene; n/a where the scene has "
+           "no such detail).  `oracle gap` = BTV on true shifts - BTV.  `gain` = MTF50(BTV) / "
+           "MTF50(bicubic) (chart only; inflated by the BTV prior, see `MTF50 BTV still` below).\n"]
     rows = []
     for scene in c.unique("scene"):
         for v in c.where(scene=scene).unique("variant"):
-            for m in SUMMARY_MOTIONS:
+            for m in _motions(c.where(scene=scene, variant=v), SUMMARY_MOTIONS):
                 d = c.where(scene=scene, variant=v, motion=m)
-                if not len(d):
-                    continue
                 rows.append([scene, v, MOTIONS[m][0], _cell(d, "shift_spread_px"), _cell(d, "intra_blur_px"),
-                             _cell(d, "bicubic.psnr"), _cell(d, "average.psnr"), _cell(d, "btv@still.psnr"),
-                             _cell(d, "btv.psnr"), _cell(d, "btv_minus_average_db"), _cell(d, "motion_gain_db"),
-                             _cell(d, "oracle_gap_db"), _cell(d, "gn_minus_hybrid_db"),
+                             _cell(d, "average.psnr"), _cell(d, "btv@still.psnr"), _cell(d, "btv@nospread.psnr"),
+                             _cell(d, "btv.psnr"), _cell(d, "motion_gain_db"), _cell(d, "motion_hf_gain"),
+                             _cell(d, "spread_gain_db"), _cell(d, "spread_hf_gain"), _cell(d, "oracle_gap_db"),
                              _cell(d, "btv@still.hf_fidelity"), _cell(d, "btv.hf_fidelity"),
                              _cell(d, "effective_gain") if scene == "chart" else "n/a"])
-    out.append(_table(["scene", "variant", "motion", "spread px", "blur px", "PSNR bicubic", "PSNR average",
-                       "PSNR BTV still", "PSNR BTV", "BTV - avg", "motion dB", "oracle gap", "gn - hybrid",
-                       "HF BTV still", "HF BTV", "gain"], rows))
+    out.append(_table(["scene", "variant", "motion", "spread px", "blur px", "PSNR average", "PSNR BTV still",
+                       "PSNR BTV no-spread", "PSNR BTV", "motion dB", "ΔHF still", "spread dB", "ΔHF spread",
+                       "oracle gap", "HF BTV still", "HF BTV", "gain"], rows))
     out.append("")
     return out
 
@@ -350,51 +409,54 @@ def central_tables(fr: Frame) -> list[str]:
         for v in c.where(scene=scene).unique("variant"):
             sub = c.where(scene=scene, variant=v)
             n = len(sub.where(motion=sub.unique("motion")[0]))
+            ms = _motions(sub, CENTRAL_MOTIONS)
             out.append(f"### {scene}, {v} (n = {n} seeds per row)\n")
-            out.append("PSNR (dB) against the box-averaged truth on the reference grid. "
-                       "`BTV still` is the paired still-twin control (same noise, no motion); "
-                       "`BTV true` uses the true shifts; `BTV gn` uses image-only registration.\n")
+            out.append("PSNR (dB) against the box-averaged truth on the reference grid. `BTV still` / "
+                       "`BTV no-spread` are the paired controls (see the summary); `BTV true` uses the "
+                       "true shifts; `BTV gn` uses image-only registration; `bicubic` merges one frame "
+                       "Adafruit-style and `bicubic 1sp` uses one subpage.\n")
             rows = []
-            for m in [m for m in CENTRAL_MOTIONS if m in sub.unique("motion")]:
+            for m in ms:
                 d = sub.where(motion=m)
                 rows.append([MOTIONS[m][0], _cell(d, "shift_spread_px"), _cell(d, "intra_blur_px"),
-                             _cell(d, "bicubic.psnr"), _cell(d, "average.psnr"), _cell(d, "btv@still.psnr"),
-                             _cell(d, "btv.psnr"), _cell(d, "btv@true.psnr"), _cell(d, "btv@gn.psnr"),
-                             _cell(d, "ibp.psnr")])
-            out.append(_table(["motion", "spread px", "blur px", "bicubic", "average", "BTV still",
-                               "BTV", "BTV true", "BTV gn", "IBP"], rows))
+                             _cell(d, "bicubic.psnr"), _cell(d, "bicubic_single.psnr"), _cell(d, "average.psnr"),
+                             _cell(d, "btv@still.psnr"), _cell(d, "btv@nospread.psnr"), _cell(d, "btv.psnr"),
+                             _cell(d, "btv@true.psnr"), _cell(d, "btv@gn.psnr"), _cell(d, "ibp.psnr"),
+                             _cell(d, "average_minus_bicubic_db")])
+            out.append(_table(["motion", "spread px", "blur px", "bicubic", "bicubic 1sp", "average", "BTV still",
+                               "BTV no-spread", "BTV", "BTV true", "BTV gn", "IBP", "average - bicubic"], rows))
             out.append("")
-            out.append("Super-resolution measures.  `gain` = MTF50(BTV) / MTF50(bicubic) "
-                       "(`vs avg`: / MTF50(average)); MTF50 in cycles per LR px (native Nyquist 0.5); "
-                       "`MTF@0.6/0.75` of BTV; "
-                       "`bar ratio` = bar limit (BTV / bicubic); `HF` = high-band fidelity "
-                       "above native Nyquist (1 = exact, 0 = none, < 0 = wrong detail; n/a "
-                       "when the scene has no such detail); `motion dB` = PSNR(BTV) - "
-                       "PSNR(BTV still).\n")
+            out.append("Super-resolution measures.  `gain` = MTF50(BTV) / MTF50(bicubic) (`vs avg`: / "
+                       "MTF50(average)); MTF50 in cycles per LR px (native Nyquist 0.5); `MTF@0.6/0.75` "
+                       "of BTV; `bar ratio` = bar limit (BTV / bicubic); `HF` = high-band fidelity "
+                       "(1 = exact, 0 = none, < 0 = wrong detail; the still twin's nonzero HF shows the "
+                       "prior alone already scores, so compare differences); `ΔHF still` / "
+                       "`ΔHF spread` = HF(BTV) minus HF of the still / no-spread twin.\n")
             rows = []
-            for m in [m for m in CENTRAL_MOTIONS if m in sub.unique("motion")]:
+            for m in ms:
                 d = sub.where(motion=m)
                 rows.append([MOTIONS[m][0], _cell(d, "effective_gain"), _cell(d, "effective_gain_vs_average"),
                              _cell(d, "bicubic.mtf50"), _cell(d, "btv.mtf50"), _cell(d, "btv@still.mtf50"),
                              _cell(d, "btv.mtf_at_0.6"), _cell(d, "btv.mtf_at_0.75"), _cell(d, "bar_ratio"),
                              _cell(d, "average.hf_fidelity"), _cell(d, "btv@still.hf_fidelity"),
-                             _cell(d, "btv.hf_fidelity"), _cell(d, "ibp.hf_fidelity"),
-                             _cell(d, "ibp@still.hf_fidelity"), _cell(d, "motion_gain_db")])
+                             _cell(d, "btv@nospread.hf_fidelity"), _cell(d, "btv.hf_fidelity"),
+                             _cell(d, "motion_hf_gain"), _cell(d, "spread_hf_gain"), _cell(d, "ibp.hf_fidelity"),
+                             _cell(d, "ibp@still.hf_fidelity")])
             out.append(_table(["motion", "gain", "vs avg", "MTF50 bicubic", "MTF50 BTV", "MTF50 BTV still",
-                               "MTF@0.6", "MTF@0.75",
-                               "bar ratio", "HF avg", "HF BTV still", "HF BTV", "HF IBP",
-                               "HF IBP still", "motion dB"], rows))
+                               "MTF@0.6", "MTF@0.75", "bar ratio", "HF avg", "HF BTV still",
+                               "HF BTV no-spread", "HF BTV", "ΔHF still", "ΔHF spread", "HF IBP",
+                               "HF IBP still"], rows))
             out.append("")
             out.append("Registration RMS error (LR px, relative to the reference subpage) and the "
                        "hybrid's gyro fallbacks (of K - 1 subpages); flat-region noise sigma (K).\n")
             rows = []
-            for m in [m for m in CENTRAL_MOTIONS if m in sub.unique("motion")]:
+            for m in ms:
                 d = sub.where(motion=m)
                 rows.append([MOTIONS[m][0], _cell(d, "reg.rms_px", 3), _cell(d, "reg_gn.rms_px", 3),
-                             _cell(d, "reg.n_fallback", 1), _cell(d, "oracle_gap_db"),
+                             _cell(d, "reg.n_fallback", 1), _cell(d, "oracle_gap_db"), _cell(d, "gn_minus_hybrid_db"),
                              _cell(d, "bicubic.flat_sigma_k", 3), _cell(d, "average.flat_sigma_k", 3),
                              _cell(d, "btv.flat_sigma_k", 3)])
-            out.append(_table(["motion", "hybrid RMS", "gn RMS", "fallbacks", "oracle gap dB",
+            out.append(_table(["motion", "hybrid RMS", "gn RMS", "fallbacks", "oracle gap dB", "gn - hybrid dB",
                                "flat σ bicubic", "flat σ average", "flat σ BTV"], rows))
             out.append("")
     return out
@@ -403,38 +465,60 @@ def central_tables(fr: Frame) -> list[str]:
 def side_tables(fr: Frame) -> list[str]:
     out = []
     specs = [
-        ("k", "K", "K (subpages)", "Frame count K at 8 Hz (duration K / 8 s)."),
-        ("refresh", "refresh_hz", "subpage rate Hz", "Subpage rate at a fixed 2 s capture (K = 2 x rate)."),
+        ("k", "K", "K (subpages)",
+         "Frame count K at 8 Hz (duration K / 8 s).  The motion synthesis normalizes the tremor and "
+         "drift RMS over each capture, so the sub-pixel spread is held (nearly) constant across K by "
+         "construction: this sweep shows more frames with the same spread, not longer hand-held "
+         "captures (which would drift further)."),
+        ("refresh", "refresh_hz", "subpage rate Hz",
+         "Subpage rate at a fixed 2 s capture (K = 2 x rate); per-subpage noise grows as √rate."),
         ("psf", "psf_sigma_px", "true PSF σ px", "True PSF sigma; the reconstruction always assumes 0.4 px."),
-        ("scale", "scale", "scale", "Output scale (3x uses lam / 2.25)."),
+        ("scale", "scale", "scale", "Output scale (3x uses lam / 2.25).  PSNR is not comparable across "
+         "scales (different truth grids); compare HF and the differences."),
+        ("exposure", "exposure", "exposure",
+         "Exposure-timing model (an assumption: the datasheet does not specify per-pixel conversion "
+         "timing).  `full`: every pixel integrates over the whole subpage period (motion faster than "
+         "the subpage rate becomes blur).  `staggered`: the pixels are converted one after another "
+         "in readout order, each over 1/384 of the period, so each pixel sees its own pose (jitter "
+         "instead of blur); `blur px` is then the RMS per-pixel pose jitter.  The reconstruction "
+         "assumes one shift per subpage in both cases, so `staggered` is also a model-mismatch "
+         "test."),
     ]
     for sweep, col, label, desc in specs:
         s = fr.where(sweep=sweep)
         if not len(s):
             continue
         out.append(f"### Sweep: {sweep}\n")
-        out.append(desc + " Chart scene, hybrid registration.  `HF` = high-band fidelity of BTV, "
-                   "`motion dB` = PSNR(BTV) - PSNR(BTV still).\n")
+        out.append(desc + "  Chart scene, hybrid registration.  " + KNOWN_NOTE + "  `motion dB` / "
+                   "`spread dB` = PSNR(BTV) minus the still / no-spread twin; `ΔHF` likewise for the "
+                   "high-band fidelity.\n")
         rows = []
         for v in s.unique("variant"):
-            for m in s.where(variant=v).unique("motion"):
-                for x in sorted(s.where(variant=v, motion=m).unique(col)):
+            present = s.where(variant=v).unique("motion")
+            order = EXPOSURE_MOTIONS if sweep == "exposure" else present
+            for m in [m for m in order if m in present]:
+                xs = s.where(variant=v, motion=m).unique(col)
+                xs = xs if sweep == "exposure" else sorted(xs)
+                for x in xs:
                     d = s.where(variant=v, motion=m, **{col: x})
-                    rows.append([v, MOTIONS[m][0], f"{x:g}", str(len(d)), _cell(d, "bicubic.psnr"),
-                                 _cell(d, "average.psnr"), _cell(d, "btv@still.psnr"), _cell(d, "btv.psnr"),
-                                 _cell(d, "btv@true.psnr"), _cell(d, "motion_gain_db"),
-                                 _cell(d, "effective_gain"), _cell(d, "btv.hf_fidelity"),
-                                 _cell(d, "reg.rms_px", 3), _cell(d, "intra_blur_px"),
+                    rows.append([v, MOTIONS[m][0], x if isinstance(x, str) else f"{x:g}", str(len(d)),
+                                 _cell(d, "average.psnr"), _cell(d, "btv@still.psnr"),
+                                 _cell(d, "btv@nospread.psnr"), _cell(d, "btv.psnr"), _cell(d, "btv@true.psnr"),
+                                 _cell(d, "motion_gain_db"), _cell(d, "motion_hf_gain"), _cell(d, "spread_gain_db"),
+                                 _cell(d, "spread_hf_gain"), _cell(d, "btv.hf_fidelity"),
+                                 _cell(d, "reg.rms_px", 3), _cell(d, "shift_spread_px"), _cell(d, "intra_blur_px"),
                                  _cell(d, "time.btv", 2)])
-        out.append(_table(["variant", "motion", label, "n", "PSNR bicubic", "PSNR average", "PSNR BTV still",
-                           "PSNR BTV", "PSNR BTV true", "motion dB", "gain", "HF", "reg RMS px",
-                           "blur px", "BTV s"], rows))
+        out.append(_table(["variant", "motion", label, "n", "PSNR average", "PSNR BTV still",
+                           "PSNR BTV no-spread", "PSNR BTV", "PSNR BTV true", "motion dB", "ΔHF still",
+                           "spread dB", "ΔHF spread", "HF BTV", "reg RMS px", "spread px", "blur px",
+                           "BTV s"], rows))
         out.append("")
     s = fr.where(sweep="reg")
     if len(s):
         out.append("### Sweep: registration versus scene contrast\n")
         out.append("Textured scene (RMS contrast in K), BAB, 8 Hz, K = 16.  RMS error in LR px "
-                   "relative to the reference subpage.\n")
+                   "relative to the reference subpage.  The hybrid's fallback is the gyro corrected "
+                   "with the image-fitted bias.\n")
         rows = []
         for m in s.unique("motion"):
             for c in sorted(s.where(motion=m).unique("contrast_k")):
@@ -461,16 +545,19 @@ def write_markdown(fr: Frame, path: Path, meta: dict) -> None:
         "",
         "Common settings unless a sweep varies them: K = 16 subpages at 8 Hz (2 s), PSF σ 0.4 px, "
         "NETD per datasheet scaled by √rate (BAB 0.71 K, BAA 0.40 K per subpage), FPN 0.1 K, "
-        "2x output, simulated 400 Hz gyro (0.007 °/s/√Hz, random 0.05-1 °/s bias, 10 ms offset), "
-        "hybrid registration.  'tremor X deg' includes the default 0.2° RMS drift; wobble cases add "
-        "a circular sweep on top of 0.1° tremor and the drift.",
+        f"{N_DEAD} dead pixels (the datasheet maximum), full-exposure timing model, 2x output, "
+        "simulated 400 Hz gyro (0.007 °/s/√Hz, random 0.05-1 °/s bias, 10 ms offset), hybrid "
+        "registration.  " + KNOWN_NOTE + "  'tremor X deg' includes the default 0.2° RMS drift; "
+        "wobble cases add a circular sweep on top of 0.1° tremor and the drift.",
         "",
         "Column guide: `spread px` = RMS sub-pixel diversity of the true subpage shifts; `blur px` = "
         "RMS motion within one exposure (not modeled by the reconstruction); `bicubic` = one frame "
         "merged Adafruit-style; `average` = registered multi-frame average at the native grid "
         "(denoising only); `BTV still` = the same BTV on a still twin of the capture (same noise and "
-        "fixed pattern, no motion: shows what the prior and deconvolution give without any "
-        "super-resolution); `BTV true` = BTV on the true shifts (oracle registration).",
+        "fixed pattern, no motion: what the prior and deconvolution give without any "
+        "super-resolution); `BTV no-spread` = BTV on a twin with the same within-exposure motion "
+        "but no subpage-to-subpage motion; `BTV true` = BTV on the true shifts (oracle "
+        "registration).",
         "",
     ]
     lines += summary_table(fr)
@@ -489,11 +576,11 @@ def write_markdown(fr: Frame, path: Path, meta: dict) -> None:
 # Reference categorical palette (light mode), fixed slot per method.
 COLORS = {
     "btv": "#2a78d6", "average": "#eb6834", "bicubic": "#1baf7a", "btv@still": "#eda100",
-    "ibp": "#e87ba4", "nc": "#008300", "btv@true": "#6250d6", "btv@gn": "#e34948",
+    "ibp": "#e87ba4", "nc": "#008300", "btv@true": "#6250d6", "btv@gn": "#e34948", "btv@nospread": "#008300",
     "gyro": "#1baf7a", "phase": "#eda100", "gn": "#eb6834", "hybrid": "#2a78d6",
 }
 LABELS = {"btv": "BTV-MAP", "average": "registered average", "bicubic": "bicubic (1 frame)",
-          "btv@still": "BTV on still twin", "btv@true": "BTV, true shifts", "btv@gn": "BTV, image-only reg.",
+          "btv@still": "BTV on still twin", "btv@nospread": "BTV on no-spread twin", "btv@true": "BTV, true shifts", "btv@gn": "BTV, image-only reg.",
           "ibp": "IBP", "nc": "normalized conv."}
 TEXT = "#0b0b0b"
 TEXT2 = "#52514e"
@@ -518,12 +605,18 @@ def _style():
     return plt
 
 
-def _series(ax, x, df_by_x, col, key, ls="-", marker="o"):
+def _series(ax, x, df_by_x, col, key, ls="-", marker="o", label=True):
     mu = np.array([_stat(d, col)[0] for d in df_by_x])
     sd = np.array([_stat(d, col)[1] for d in df_by_x])
     sd = np.where(np.isfinite(sd), sd, 0.0)
     ax.errorbar(x, mu, yerr=sd, color=COLORS[key], ls=ls, marker=marker, capsize=2, elinewidth=1,
-                label=LABELS.get(key, key), markeredgecolor=SURFACE, markeredgewidth=1.5)
+                label=LABELS.get(key, key) if label else None, markeredgecolor=SURFACE,
+                markeredgewidth=1.5)
+
+
+def _short_motion(m: str) -> str:
+    return (MOTIONS[m][0].replace(" deg", "°").replace("+/-", "±")
+            .replace("wobble ", "wobble\n").replace("tremor ", "tremor\n"))
 
 
 def plot_psnr_vs_motion(fr: Frame, out: Path, scene: str = "chart") -> Path | None:
@@ -539,14 +632,17 @@ def plot_psnr_vs_motion(fr: Frame, out: Path, scene: str = "chart") -> Path | No
         d = c.where(variant=v)
         x = np.arange(len(order))
         groups = [d.where(motion=m) for m in order]
-        for key in ("bicubic", "average", "btv@still", "btv", "btv@true"):
-            _series(ax, x, groups, f"{key}.psnr", key, ls="--" if key == "btv@true" else "-")
         n_t = sum(m in TREMOR_ORDER for m in order)
+        for key in ("bicubic", "average", "btv@still", "btv@nospread", "btv", "btv@true"):
+            ls = "--" if key == "btv@true" else "-"
+            # Tremor and wobble cases are separate groups: no line joins them.
+            for lo, hi, lab in ((0, n_t, True), (n_t, len(order), n_t == 0)):
+                if hi > lo:
+                    _series(ax, x[lo:hi], groups[lo:hi], f"{key}.psnr", key, ls=ls, label=lab)
         if 0 < n_t < len(order):
             ax.axvline(n_t - 0.5, color=TEXT2, lw=0.8, ls=":")
         ax.set_xticks(x)
-        ax.set_xticklabels([MOTIONS[m][0].replace("wobble ", "wobble\n").replace("tremor ", "tremor\n")
-                            for m in order], fontsize=7)
+        ax.set_xticklabels([_short_motion(m) for m in order], fontsize=7)
         ax.set_title(f"{scene} scene, MLX90640 {v}")
         ax.set_ylabel("PSNR vs truth (dB)")
     axes[0][0].legend(loc="lower left", fontsize=7)
@@ -639,8 +735,8 @@ def plot_gain_vs_k(fr: Frame, out: Path) -> Path | None:
         for mi, m in enumerate(s.where(variant=v).unique("motion")):
             d = s.where(variant=v, motion=m)
             ks = sorted(d.unique("K"))
-            mu = [_stat(d.where(K=k), "motion_gain_db")[0] for k in ks]
-            sd = [_stat(d.where(K=k), "motion_gain_db")[1] for k in ks]
+            mu = [_stat(d.where(K=k), "spread_gain_db")[0] for k in ks]
+            sd = [_stat(d.where(K=k), "spread_gain_db")[1] for k in ks]
             sd = np.where(np.isfinite(sd), sd, 0.0)
             ax.errorbar(ks, mu, yerr=sd, color=pal[mi % 2], ls=styles.get(v, "-"), marker="o", capsize=2,
                         elinewidth=1, label=f"{v}, {MOTIONS[m][0]}", markeredgecolor=SURFACE,
@@ -651,8 +747,8 @@ def plot_gain_vs_k(fr: Frame, out: Path) -> Path | None:
     ax.set_xticks(ks)
     ax.set_xticklabels([str(k) for k in ks])
     ax.set_xlabel("subpages K (8 Hz)")
-    ax.set_ylabel("PSNR(BTV) - PSNR(BTV still) (dB)")
-    ax.set_title("Gain the motion buys versus frame count")
+    ax.set_ylabel("PSNR(BTV) - PSNR(BTV no-spread) (dB)")
+    ax.set_title("Gain from sub-pixel spread vs K (spread held constant)")
     ax.legend(fontsize=7)
     fig.tight_layout()
     p = out / "gain_vs_k.png"
@@ -703,11 +799,21 @@ def plot_reg_vs_contrast(fr: Frame, out: Path) -> Path | None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--quick", action="store_true", help="smoke run (1 seed, reduced grid)")
-    ap.add_argument("--out", type=Path, default=ROOT / "docs" / "results", help="output directory")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="output directory (default: docs/results; with --quick a new temp directory, "
+                         "so the committed full results are not overwritten)")
+    ap.add_argument("--full-csv", action="store_true", help="also write results_full.csv (every column)")
     ap.add_argument("--seeds", type=int, default=None, help="override the number of seeds")
     ap.add_argument("--jobs", type=int, default=None, help="worker processes (default: CPU count - 1)")
     ap.add_argument("--sweeps", default=None, help="comma-separated subset: central,k,refresh,psf,scale,reg")
     args = ap.parse_args(argv)
+    if args.out is None:
+        if args.quick:
+            import tempfile
+
+            args.out = Path(tempfile.mkdtemp(prefix="mlx_sr-quick-"))
+        else:
+            args.out = ROOT / "docs" / "results"
 
     cases = build_cases(args.quick, args.seeds)
     if args.sweeps:
@@ -733,6 +839,8 @@ def main(argv: list[str] | None = None) -> int:
 
     fr = Frame(rows)
     write_csv(rows, args.out / "results.csv")
+    if args.full_csv:
+        write_csv(rows, args.out / "results_full.csv", compact=False)
     write_markdown(fr, args.out / "results.md",
                    dict(quick=args.quick, n_cases=len(cases), runtime_s=runtime, jobs=jobs))
     plots = [
