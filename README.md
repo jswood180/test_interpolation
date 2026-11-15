@@ -79,7 +79,11 @@ conclusions rest on paired controls:
 - **No-spread twin**: a twin with the same motion *within* every exposure (the
   same blur or jitter) but with each subpage's mean pose removed, so there is no
   sub-pixel spread between subpages. `spread dB` = BTV minus this twin: the
-  effect of the spread alone, the only part that can be super-resolution.
+  effect of the spread, the only part that can be super-resolution. BTV runs on
+  the *estimated* shifts while the twin needs no registration, so `spread dB`
+  also contains the (small) registration error; results.md also lists the
+  like-for-like version with BTV on the true shifts (`spread dB true`,
+  `ΔHF spread true`).
 - **High-band fidelity** (`HF`): `1 - |H(x - truth)|^2 / |H truth|^2` where `H`
   keeps only frequencies above the sensor's Nyquist (1 = that detail recovered
   exactly, 0 = none, negative = wrong detail). Misplaced or aliased detail lowers
@@ -87,8 +91,14 @@ conclusions rest on paired controls:
   (the still twin reaches 0.13-0.14 on the chart and 0.63-0.68 on the people
   scene), so it is used only as a difference: `ΔHF spread` = HF(BTV) minus
   HF(no-spread twin). PSNR can rise without any gain in HF (see below), so a
-  result counts as super-resolution here only when `ΔHF spread` is clearly
-  positive.
+  result counts as super-resolution here only when `ΔHF spread` is
+  significantly positive.
+- **Significance** (one criterion everywhere): every difference above is
+  computed per seed against the twin with the same seed, and it is called
+  significant (marked † here and in results.md) when its mean exceeds two
+  standard errors, |mean| > 2 std / √n with n = 5 seeds. Significant is not the
+  same as large: some significant HF changes are only a few hundredths, against
+  0.44 for the best case, and the sizes are given with each claim.
 
 ## Results and conclusions
 
@@ -101,28 +111,30 @@ these are best-case numbers for the reconstruction.
 
 Chart scene, full-exposure model:
 
-| variant | motion | spread px | blur px | PSNR BTV still | PSNR BTV no-spread | PSNR BTV | motion dB | spread dB | ΔHF spread | HF still → BTV |
-|---|---|---|---|---|---|---|---|---|---|---|
-| BAB | tremor 0.1 deg, no drift | 0.01 | 0.08 | 26.15 | 26.19 | 26.32 | 0.16 ± 0.19 | 0.13 ± 0.18 | -0.03 ± 0.02 | 0.13 → 0.10 |
-| BAB | tremor 0.1 deg (+ drift) | 0.17 | 0.08 | 26.15 | 26.19 | 26.84 | 0.68 ± 0.45 | 0.64 ± 0.47 | 0.04 ± 0.07 | 0.13 → 0.17 |
-| BAB | tremor 1 deg | 0.22 | 0.80 | 26.15 | 23.11 | 23.74 | -2.42 ± 0.38 | 0.62 ± 0.21 | -0.01 ± 0.04 | 0.13 → 0.02 |
-| BAB | wobble ±1 deg 0.5 Hz | 0.64 | 0.11 | 26.15 | 26.20 | 28.18 | 2.02 ± 0.90 | 1.98 ± 0.92 | 0.10 ± 0.12 | 0.13 → 0.23 |
-| BAB | wobble ±2 deg 1 Hz | 1.19 | 0.28 | 26.15 | 26.08 | 27.53 | 1.38 ± 0.43 | 1.45 ± 0.50 | 0.02 ± 0.08 | 0.13 → 0.12 |
-| BAA | tremor 0.1 deg (+ drift) | 0.07 | 0.03 | 26.25 | 26.29 | 26.54 | 0.29 ± 0.24 | 0.25 ± 0.24 | 0.03 ± 0.01 | 0.14 → 0.17 |
-| BAA | wobble ±2 deg 1 Hz | 0.47 | 0.11 | 26.25 | 26.37 | 28.78 | 2.53 ± 1.11 | 2.40 ± 1.08 | 0.44 ± 0.02 | 0.14 → 0.58 |
+| variant | motion | spread px | blur px | PSNR BTV still | PSNR BTV no-spread | PSNR BTV | motion dB | spread dB | ΔHF spread | ΔHF spread true | HF still → BTV |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| BAB | tremor 0.1 deg, no drift | 0.01 | 0.08 | 26.15 | 26.19 | 26.32 | 0.16 ± 0.19 | 0.13 ± 0.18 | -0.03 ± 0.02† | -0.03 ± 0.02† | 0.13 → 0.10 |
+| BAB | tremor 0.1 deg (+ drift) | 0.17 | 0.08 | 26.15 | 26.19 | 26.84 | 0.68 ± 0.45† | 0.64 ± 0.47† | 0.04 ± 0.07 | 0.04 ± 0.06 | 0.13 → 0.17 |
+| BAB | tremor 1 deg | 0.22 | 0.80 | 26.15 | 23.11 | 23.74 | -2.42 ± 0.38† | 0.62 ± 0.21† | -0.01 ± 0.04 | -0.01 ± 0.05 | 0.13 → 0.02 |
+| BAB | wobble ±1 deg 0.5 Hz | 0.64 | 0.11 | 26.15 | 26.20 | 28.18 | 2.02 ± 0.90† | 1.98 ± 0.92† | 0.10 ± 0.12 | 0.11 ± 0.12† | 0.13 → 0.23 |
+| BAB | wobble ±2 deg 1 Hz | 1.19 | 0.28 | 26.15 | 26.08 | 27.53 | 1.38 ± 0.43† | 1.45 ± 0.50† | 0.02 ± 0.08 | 0.02 ± 0.08 | 0.13 → 0.12 |
+| BAA | tremor 0.1 deg (+ drift) | 0.07 | 0.03 | 26.25 | 26.29 | 26.54 | 0.29 ± 0.24† | 0.25 ± 0.24† | 0.03 ± 0.01† | 0.03 ± 0.01† | 0.14 → 0.17 |
+| BAA | wobble ±2 deg 1 Hz | 0.47 | 0.11 | 26.25 | 26.37 | 28.78 | 2.53 ± 1.11† | 2.40 ± 1.08† | 0.44 ± 0.02† | 0.45 ± 0.03† | 0.14 → 0.58 |
 
 Full versus staggered exposure timing (chart, from the exposure sweep):
 
 | variant | motion | motion dB full | motion dB staggered | ΔHF spread full | ΔHF spread staggered |
 |---|---|---|---|---|---|
-| BAB | tremor 0.1 deg, no drift | 0.16 ± 0.19 | -0.00 ± 0.21 | -0.03 ± 0.02 | -0.03 ± 0.02 |
-| BAB | tremor 0.1 deg (+ drift) | 0.68 ± 0.45 | 0.42 ± 0.55 | 0.04 ± 0.07 | 0.03 ± 0.06 |
-| BAB | tremor 0.3 deg (+ drift) | 1.44 ± 0.68 | -0.12 ± 1.01 | 0.01 ± 0.04 | -0.05 ± 0.04 |
-| BAB | wobble ±1 deg 0.5 Hz | 2.02 ± 0.90 | 1.68 ± 0.82 | 0.10 ± 0.12 | 0.09 ± 0.12 |
-| BAB | wobble ±2 deg 1 Hz | 1.38 ± 0.43 | -1.66 ± 1.18 | 0.02 ± 0.08 | -0.10 ± 0.10 |
-| BAA | tremor 0.1 deg, no drift | 0.17 ± 0.14 | 0.14 ± 0.14 | -0.01 ± 0.01 | -0.02 ± 0.01 |
-| BAA | tremor 0.3 deg (+ drift) | 0.37 ± 0.12 | 0.01 ± 0.23 | 0.01 ± 0.03 | -0.03 ± 0.03 |
-| BAA | wobble ±2 deg 1 Hz | 2.53 ± 1.11 | 2.06 ± 0.97 | 0.44 ± 0.02 | 0.42 ± 0.04 |
+| BAB | tremor 0.1 deg, no drift | 0.16 ± 0.19 | -0.00 ± 0.21 | -0.03 ± 0.02† | -0.03 ± 0.02† |
+| BAB | tremor 0.1 deg (+ drift) | 0.68 ± 0.45† | 0.42 ± 0.55 | 0.04 ± 0.07 | 0.03 ± 0.06 |
+| BAB | tremor 0.3 deg (+ drift) | 1.44 ± 0.68† | -0.12 ± 1.01 | 0.01 ± 0.04 | -0.05 ± 0.04† |
+| BAB | wobble ±1 deg 0.5 Hz | 2.02 ± 0.90† | 1.68 ± 0.82† | 0.10 ± 0.12 | 0.09 ± 0.12 |
+| BAB | wobble ±2 deg 1 Hz | 1.38 ± 0.43† | -1.66 ± 1.18† | 0.02 ± 0.08 | -0.10 ± 0.10† |
+| BAA | tremor 0.1 deg, no drift | 0.17 ± 0.14† | 0.14 ± 0.14† | -0.01 ± 0.01† | -0.02 ± 0.01† |
+| BAA | tremor 0.3 deg (+ drift) | 0.37 ± 0.12† | 0.01 ± 0.23 | 0.01 ± 0.03 | -0.03 ± 0.03† |
+| BAA | wobble ±2 deg 1 Hz | 2.53 ± 1.11† | 2.06 ± 0.97† | 0.44 ± 0.02† | 0.42 ± 0.04† |
+
+† = significant: |mean| > 2 standard errors over the 5 paired seeds.
 
 `spread px` is the RMS sub-pixel diversity of the true subpage shifts, `blur px`
 the RMS motion within one exposure (per-pixel jitter in the staggered mode).
@@ -133,37 +145,42 @@ Plots: [PSNR vs motion](docs/results/psnr_vs_motion_chart.png),
 [PSNR vs PSF](docs/results/psnr_vs_psf.png),
 [registration vs contrast](docs/results/reg_rms_vs_contrast.png).
 
-**Does natural tremor alone help on the MLX90640? No, under either exposure
-model.** Tremor by itself (no drift) leaves 0.01 px of spread between subpages.
-Its motion gain on the chart is within the seed scatter (BAB 0.16 ± 0.19 dB
-full, -0.00 ± 0.21 dB staggered; BAA 0.17 ± 0.14 and 0.14 ± 0.14 dB), and its
-high-band fidelity change is slightly negative in all four cases. The assumed
-0.2 deg drift adds 0.17 px of spread on the BAB and raises PSNR (spread dB
-0.64 ± 0.47), but the high-band fidelity gain stays within the scatter
-(0.04 ± 0.07), so it is not measurable super-resolution. On the people and
-smooth-texture scenes natural motion gives no gain at all. Larger tremor hurts:
+**Does natural tremor alone help on the MLX90640? No super-resolution, under
+either exposure model.** Tremor by itself (no drift) leaves 0.01 px of spread
+between subpages. Its PSNR effect on the chart is small: not significant on the
+BAB (0.16 ± 0.19 dB full, -0.00 ± 0.21 dB staggered) and a significant but small
+gain on the BAA (0.17 ± 0.14† and 0.14 ± 0.14† dB). Its high-band fidelity
+change is significantly *negative* in all four cases (-0.01 to -0.03). The
+assumed 0.2 deg drift adds 0.17 px of spread on the BAB and significantly raises
+PSNR (spread dB 0.64 ± 0.47†), but the high-band fidelity gain is not
+significant (0.04 ± 0.07). On the BAA the drift (0.07 px of spread) gives a
+significant but small HF gain, 0.03 ± 0.01†, a fifteenth of the deliberate
+wobble's. On the people and smooth-texture scenes natural motion gives no gain
+at all. Larger tremor hurts:
 at 1 deg on the BAB the blur alone takes the no-spread twin from 26.15 to
 23.11 dB. Under the staggered model, 0.3 deg tremor on the BAB turns a
 1.44 ± 0.68 dB PSNR gain into -0.12 ± 1.01 dB, because the per-pixel jitter is
 not modeled by the reconstruction.
 
 **How much does deliberate wobble help? Clearly on the BAA chart; on the BAB
-only in PSNR.** A ±2 deg circular wobble at 1 Hz on the BAA gives a spread gain
-of 2.40 ± 1.08 dB with ΔHF spread 0.44 ± 0.02 (HF 0.14 → 0.58). This is the
+mostly in PSNR.** A ±2 deg circular wobble at 1 Hz on the BAA gives a spread gain
+of 2.40 ± 1.08† dB with ΔHF spread 0.44 ± 0.02† (HF 0.14 → 0.58). This is the
 clearest super-resolution in the benchmark, and it holds under the staggered
-model (motion dB 2.06 ± 0.97, ΔHF spread 0.42 ± 0.04). The ±1 deg 0.5 Hz
-(ΔHF spread 0.26 ± 0.10) and ±2 deg 2 Hz (0.24 ± 0.17) BAA wobbles also show it.
-On the BAB the wobble raises PSNR (spread dB 1.45 ± 0.50 at ±2 deg 1 Hz,
-1.98 ± 0.92 at ±1 deg 0.5 Hz) but the high-band fidelity gain is within the
-scatter (0.02 ± 0.08 and 0.10 ± 0.12), and under the staggered model the 1 Hz
-wobble becomes a loss (-1.66 ± 1.18 dB). The BAB shows an HF gain only with more
-or faster frames: ΔHF spread 0.15 ± 0.11 at a 16 Hz subpage rate (same 2 s) and
-0.14 ± 0.07 with K = 32. The frame-count sweep holds the spread constant by
+model (motion dB 2.06 ± 0.97†, ΔHF spread 0.42 ± 0.04†). The ±1 deg 0.5 Hz
+(ΔHF spread 0.26 ± 0.10†) and ±2 deg 2 Hz (0.24 ± 0.17†) BAA wobbles also show
+it. On the BAB at 8 Hz the wobble significantly raises PSNR (spread dB
+1.45 ± 0.50† at ±2 deg 1 Hz, 1.98 ± 0.92† at ±1 deg 0.5 Hz), but the HF gain is
+not significant with estimated shifts (0.02 ± 0.08 and 0.10 ± 0.12); with true
+shifts the 0.5 Hz case is significant but modest (0.11 ± 0.12†). Under the
+staggered model the BAB 1 Hz wobble becomes a significant loss
+(-1.66 ± 1.18† dB). The BAB shows a significant HF gain with more or faster
+frames: ΔHF spread 0.15 ± 0.11† at a 16 Hz subpage rate (same 2 s) and
+0.14 ± 0.07† with K = 32. The frame-count sweep holds the spread constant by
 construction (the motion RMS is normalized per capture), so it shows more frames
-with the same spread: the BAA wobble's ΔHF spread rises from 0.02 ± 0.11 at
-K = 4 to 0.51 ± 0.06 at K = 32, while for 0.3 deg tremor on the BAB it stays at
-or below 0.04 ± 0.06 even though spread dB rises from 1.01 ± 0.51 to
-1.94 ± 0.61. **None of this carries over to the people or smooth-texture
+with the same spread: the BAA wobble's ΔHF spread rises from 0.02 ± 0.11 (not
+significant) at K = 4 to 0.51 ± 0.06† at K = 32, while for 0.3 deg tremor on
+the BAB it is never significant (at most 0.04 ± 0.06) even though spread dB
+rises from 1.01 ± 0.51† to 1.94 ± 0.61†. **None of this carries over to the people or smooth-texture
 scenes**, where wobble gains nothing over the still twin (people BAB
 0.36 ± 0.86 dB, BAA -1.77 ± 2.33 dB; texture BAB 0.00 ± 0.29 dB, BAA
 -1.45 ± 0.28 dB at ±2 deg 1 Hz).
@@ -176,7 +193,7 @@ headline gain is neither.** On the chart with natural tremor (BAB):
 - average to BTV on the still twin (prior plus PSF deconvolution, no motion):
   23.32 to 26.15 dB.
 - still twin to the real capture: 26.15 to 26.84 dB, of which the spread
-  accounts for 0.64 ± 0.47 dB without a measurable HF gain.
+  accounts for 0.64 ± 0.47† dB without a significant HF gain (0.04 ± 0.07).
 
 The slanted-edge "effective gain" (MTF50 of BTV over bicubic) is 3.3-4.0 for
 most chart cases, but **it is not evidence of super-resolution**: BTV on the
@@ -190,8 +207,10 @@ Nyquist, and the chart-tuned regularization is too weak for it.
 **Oracle versus estimated shifts: registration is not the bottleneck.** The
 hybrid registration error on the chart is 0.014-0.064 px RMS for every motion
 except 3 deg tremor, and BTV on the true shifts is between -0.06 and 0.39 dB
-better. Image-only Gauss-Newton is close on the chart (`gn - hybrid` between
--0.98 and +0.23 dB). The gyro matters at low contrast: on a 1 K texture the
+better; only one of these gaps is significant (0.11 ± 0.08†, BAA 1 deg
+tremor). Image-only Gauss-Newton is close on the chart (`gn - hybrid` between
+-0.98 and +0.23 dB; significantly worse than the hybrid in 4 of 18 chart
+cases, most at -0.12 to -0.18 dB and -0.98 ± 0.71† for the BAA 2 Hz wobble). The gyro matters at low contrast: on a 1 K texture the
 hybrid reaches 0.108 px against 0.238 px image-only, and at 0.3 K image-only
 registration fails (2.862 px) while the hybrid falls back to the bias-limited
 gyro (0.526 px). At 3 deg of tremor on the BAB the hybrid falls back to the gyro
@@ -200,17 +219,22 @@ for 15 of 15 subpages (0.237 px).
 **BAA versus BAB.** The wide BAA turns the same hand motion into less shift
 (0.07 vs 0.17 px of spread for natural motion), but also into less blur and
 jitter, and it has lower noise (0.40 vs 0.71 K per subpage at 8 Hz). With
-deliberate wobble it is the only variant with a clear HF gain at 8 Hz
-(HF 0.58 vs 0.12 at ±2 deg 1 Hz). Its lens distortion is not modeled (the shift
+deliberate wobble it is the only variant with a large, significant HF gain at
+8 Hz (HF 0.58 vs 0.12 at ±2 deg 1 Hz). Its lens distortion is not modeled (the shift
 grows toward the corners), so BAA results are optimistic.
 
 **Other findings.**
 - **The PSF assumption is critical.** Assuming 0.4 px when the true PSF is
   0.2 px makes BTV worse than the registered average even without motion
   (still twin 21.99 dB against 24.38 dB on the BAB); with a wider true PSF
-  (0.6-0.8 px) the spread gain is 0.12-0.97 dB and the ΔHF spread at most 0.02.
-- **3x output adds no high-band fidelity over 2x** (0.52 vs 0.58 for the BAA
-  wobble; ΔHF over the still twin 0.48 ± 0.04 vs 0.44 ± 0.02).
+  (0.6-0.8 px) the spread gain is 0.12-0.97 dB and the ΔHF spread at most 0.02
+  (a few hundredths even where significant).
+- **3x output: about the same super-resolution as 2x.** Compared like for like,
+  as the gain over the still twin on the same grid, the BAA wobble's ΔHF is
+  0.48 ± 0.04† at 3x against 0.44 ± 0.02† at 2x (ΔHF spread 0.49 ± 0.04† vs
+  0.44 ± 0.02†), slightly higher. The absolute HF values (0.52 vs 0.58) are not
+  comparable because the 3x band reaches higher frequencies. For 0.3 deg tremor
+  on the BAB the 3x ΔHF spread is small (0.06 ± 0.05†).
 - **Expected gain**: the research estimate of 1.3-1.8x effective linear
   resolution (docs/RESEARCH.md, unverified) cannot be tested with MTF50 here
   because of the prior effect. Measurable recovery of detail above the sensor's
@@ -295,7 +319,7 @@ python scripts/run_benchmark.py --quick   # smoke run in seconds, written to a n
 python scripts/run_benchmark.py  # full sweep: docs/results/results.{md,csv} and PNG plots
 ```
 
-The full benchmark (690 cases) took 108 s on 31 worker processes; use
+The full benchmark (690 cases) took 99 s on 31 worker processes; use
 `--jobs N` to limit the processes, `--sweeps central,k,refresh,psf,scale,reg,exposure`
 to run a subset and `--full-csv` to also write every metric column. It runs all
 sweeps from the plan with 5 seeds each, with these deliberate trims: the

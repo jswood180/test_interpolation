@@ -266,6 +266,29 @@ def _cell(df, col, nd=2):
     return _fmt(*_stat(df, col), nd=nd)
 
 
+SIG = "†"
+"""Marks a paired difference whose mean exceeds 2 standard errors (std / sqrt(n))."""
+
+
+def significant(df, col) -> bool:
+    """True when the mean of the per-seed (paired) differences in ``col``
+    is more than two standard errors from zero."""
+    if col not in df.columns:
+        return False
+    v = df[col].astype(float).to_numpy()
+    v = v[np.isfinite(v)]
+    if v.size < 2:
+        return False
+    se = v.std(ddof=1) / np.sqrt(v.size)
+    return bool(abs(v.mean()) > 2.0 * se)
+
+
+def _dcell(df, col, nd=2):
+    """A paired-difference cell, flagged with :data:`SIG` when significant."""
+    c = _cell(df, col, nd)
+    return c + SIG if c != "n/a" and significant(df, col) else c
+
+
 def _table(header: list[str], rows: list[list[str]]) -> str:
     out = ["| " + " | ".join(header) + " |", "|" + "|".join(["---"] * len(header)) + "|"]
     out += ["| " + " | ".join(r) + " |" for r in rows]
@@ -380,7 +403,9 @@ def summary_table(fr: Frame) -> list[str]:
            "`motion dB` = BTV - still and `ΔHF still` = HF(BTV) - HF(still): the total effect of the "
            "motion.  `spread dB` = BTV - no-spread and `ΔHF spread` = HF(BTV) - HF(no-spread): the "
            "effect of the sub-pixel spread between subpages alone, i.e. the part that can be "
-           "super-resolution.  `HF` = high-band fidelity (detail above native Nyquist; meaningful "
+           "super-resolution; it uses BTV on the *estimated* shifts, so it includes the registration "
+           "error, and `spread dB true` / `ΔHF spread true` use BTV on the true shifts (like for like with "
+           "the twin, which needs no registration).  `HF` = high-band fidelity (detail above native Nyquist; meaningful "
            "only as a difference between reconstructions of the same scene; n/a where the scene has "
            "no such detail).  `oracle gap` = BTV on true shifts - BTV.  `gain` = MTF50(BTV) / "
            "MTF50(bicubic) (chart only; inflated by the BTV prior, see `MTF50 BTV still` below).\n"]
@@ -391,13 +416,15 @@ def summary_table(fr: Frame) -> list[str]:
                 d = c.where(scene=scene, variant=v, motion=m)
                 rows.append([scene, v, MOTIONS[m][0], _cell(d, "shift_spread_px"), _cell(d, "intra_blur_px"),
                              _cell(d, "average.psnr"), _cell(d, "btv@still.psnr"), _cell(d, "btv@nospread.psnr"),
-                             _cell(d, "btv.psnr"), _cell(d, "motion_gain_db"), _cell(d, "motion_hf_gain"),
-                             _cell(d, "spread_gain_db"), _cell(d, "spread_hf_gain"), _cell(d, "oracle_gap_db"),
-                             _cell(d, "btv@still.hf_fidelity"), _cell(d, "btv.hf_fidelity"),
+                             _cell(d, "btv.psnr"), _dcell(d, "motion_gain_db"), _dcell(d, "motion_hf_gain"),
+                             _dcell(d, "spread_gain_db"), _dcell(d, "spread_hf_gain"),
+                             _dcell(d, "spread_gain_oracle_db"), _dcell(d, "spread_hf_gain_oracle"),
+                             _dcell(d, "oracle_gap_db"), _cell(d, "btv@still.hf_fidelity"), _cell(d, "btv.hf_fidelity"),
                              _cell(d, "effective_gain") if scene == "chart" else "n/a"])
     out.append(_table(["scene", "variant", "motion", "spread px", "blur px", "PSNR average", "PSNR BTV still",
                        "PSNR BTV no-spread", "PSNR BTV", "motion dB", "ΔHF still", "spread dB", "ΔHF spread",
-                       "oracle gap", "HF BTV still", "HF BTV", "gain"], rows))
+                       "spread dB true", "ΔHF spread true", "oracle gap", "HF BTV still", "HF BTV", "gain"],
+                      rows))
     out.append("")
     return out
 
@@ -422,7 +449,7 @@ def central_tables(fr: Frame) -> list[str]:
                              _cell(d, "bicubic.psnr"), _cell(d, "bicubic_single.psnr"), _cell(d, "average.psnr"),
                              _cell(d, "btv@still.psnr"), _cell(d, "btv@nospread.psnr"), _cell(d, "btv.psnr"),
                              _cell(d, "btv@true.psnr"), _cell(d, "btv@gn.psnr"), _cell(d, "ibp.psnr"),
-                             _cell(d, "average_minus_bicubic_db")])
+                             _dcell(d, "average_minus_bicubic_db")])
             out.append(_table(["motion", "spread px", "blur px", "bicubic", "bicubic 1sp", "average", "BTV still",
                                "BTV no-spread", "BTV", "BTV true", "BTV gn", "IBP", "average - bicubic"], rows))
             out.append("")
@@ -440,7 +467,7 @@ def central_tables(fr: Frame) -> list[str]:
                              _cell(d, "btv.mtf_at_0.6"), _cell(d, "btv.mtf_at_0.75"), _cell(d, "bar_ratio"),
                              _cell(d, "average.hf_fidelity"), _cell(d, "btv@still.hf_fidelity"),
                              _cell(d, "btv@nospread.hf_fidelity"), _cell(d, "btv.hf_fidelity"),
-                             _cell(d, "motion_hf_gain"), _cell(d, "spread_hf_gain"), _cell(d, "ibp.hf_fidelity"),
+                             _dcell(d, "motion_hf_gain"), _dcell(d, "spread_hf_gain"), _cell(d, "ibp.hf_fidelity"),
                              _cell(d, "ibp@still.hf_fidelity")])
             out.append(_table(["motion", "gain", "vs avg", "MTF50 bicubic", "MTF50 BTV", "MTF50 BTV still",
                                "MTF@0.6", "MTF@0.75", "bar ratio", "HF avg", "HF BTV still",
@@ -453,7 +480,7 @@ def central_tables(fr: Frame) -> list[str]:
             for m in ms:
                 d = sub.where(motion=m)
                 rows.append([MOTIONS[m][0], _cell(d, "reg.rms_px", 3), _cell(d, "reg_gn.rms_px", 3),
-                             _cell(d, "reg.n_fallback", 1), _cell(d, "oracle_gap_db"), _cell(d, "gn_minus_hybrid_db"),
+                             _cell(d, "reg.n_fallback", 1), _dcell(d, "oracle_gap_db"), _dcell(d, "gn_minus_hybrid_db"),
                              _cell(d, "bicubic.flat_sigma_k", 3), _cell(d, "average.flat_sigma_k", 3),
                              _cell(d, "btv.flat_sigma_k", 3)])
             out.append(_table(["motion", "hybrid RMS", "gn RMS", "fallbacks", "oracle gap dB", "gn - hybrid dB",
@@ -504,13 +531,15 @@ def side_tables(fr: Frame) -> list[str]:
                     rows.append([v, MOTIONS[m][0], x if isinstance(x, str) else f"{x:g}", str(len(d)),
                                  _cell(d, "average.psnr"), _cell(d, "btv@still.psnr"),
                                  _cell(d, "btv@nospread.psnr"), _cell(d, "btv.psnr"), _cell(d, "btv@true.psnr"),
-                                 _cell(d, "motion_gain_db"), _cell(d, "motion_hf_gain"), _cell(d, "spread_gain_db"),
-                                 _cell(d, "spread_hf_gain"), _cell(d, "btv.hf_fidelity"),
+                                 _dcell(d, "motion_gain_db"), _dcell(d, "motion_hf_gain"), _dcell(d, "spread_gain_db"),
+                                 _dcell(d, "spread_hf_gain"), _dcell(d, "spread_hf_gain_oracle"),
+                                 _cell(d, "btv.hf_fidelity"),
                                  _cell(d, "reg.rms_px", 3), _cell(d, "shift_spread_px"), _cell(d, "intra_blur_px"),
                                  _cell(d, "time.btv", 2)])
         out.append(_table(["variant", "motion", label, "n", "PSNR average", "PSNR BTV still",
                            "PSNR BTV no-spread", "PSNR BTV", "PSNR BTV true", "motion dB", "ΔHF still",
-                           "spread dB", "ΔHF spread", "HF BTV", "reg RMS px", "spread px", "blur px",
+                           "spread dB", "ΔHF spread", "ΔHF spread true", "HF BTV", "reg RMS px", "spread px",
+                           "blur px",
                            "BTV s"], rows))
         out.append("")
     s = fr.where(sweep="reg")
@@ -542,6 +571,11 @@ def write_markdown(fr: Frame, path: Path, meta: dict) -> None:
         + f".  {meta['n_cases']} cases, {meta['runtime_s']:.0f} s wall time on {meta['jobs']} worker processes.",
         "All values are mean ± sample std over seeds.  Simulation only (see the README for the model "
         "and its limitations).",
+        "",
+        f"Significance: a paired difference (motion dB, spread dB, ΔHF, oracle gap and the like, computed "
+        f"per seed against the twin with the same seed) is marked {SIG} when its mean exceeds two "
+        "standard errors, |mean| > 2 std / √n.  Unmarked differences are not distinguishable from zero "
+        "at this seed count.",
         "",
         "Common settings unless a sweep varies them: K = 16 subpages at 8 Hz (2 s), PSF σ 0.4 px, "
         "NETD per datasheet scaled by √rate (BAB 0.71 K, BAA 0.40 K per subpage), FPN 0.1 K, "
@@ -576,7 +610,7 @@ def write_markdown(fr: Frame, path: Path, meta: dict) -> None:
 # Reference categorical palette (light mode), fixed slot per method.
 COLORS = {
     "btv": "#2a78d6", "average": "#eb6834", "bicubic": "#1baf7a", "btv@still": "#eda100",
-    "ibp": "#e87ba4", "nc": "#008300", "btv@true": "#6250d6", "btv@gn": "#e34948", "btv@nospread": "#008300",
+    "ibp": "#e87ba4", "nc": "#008300", "btv@true": "#6250d6", "btv@gn": "#e34948", "btv@nospread": "#e34948",
     "gyro": "#1baf7a", "phase": "#eda100", "gn": "#eb6834", "hybrid": "#2a78d6",
 }
 LABELS = {"btv": "BTV-MAP", "average": "registered average", "bicubic": "bicubic (1 frame)",
@@ -805,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--full-csv", action="store_true", help="also write results_full.csv (every column)")
     ap.add_argument("--seeds", type=int, default=None, help="override the number of seeds")
     ap.add_argument("--jobs", type=int, default=None, help="worker processes (default: CPU count - 1)")
-    ap.add_argument("--sweeps", default=None, help="comma-separated subset: central,k,refresh,psf,scale,reg")
+    ap.add_argument("--sweeps", default=None, help="comma-separated subset: central,k,refresh,psf,scale,reg,exposure")
     args = ap.parse_args(argv)
     if args.out is None:
         if args.quick:
