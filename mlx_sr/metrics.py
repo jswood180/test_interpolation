@@ -41,6 +41,7 @@ __all__ = [
     "hotspot_error",
     "flat_sigma",
     "registration_rms",
+    "highband_fidelity",
     "MTF_OVERSAMPLE",
     "BAR_CONTRAST_THRESHOLD",
 ]
@@ -172,6 +173,52 @@ def ssim(img: np.ndarray, ref: np.ndarray, *, data_range: float | None = None, b
     if not keep.any():
         return float("nan")
     return float(np.mean(smap[keep]))
+
+
+# ---------------------------------------------------------------------------
+# High-band (above native Nyquist) fidelity
+# ---------------------------------------------------------------------------
+
+
+def highband_fidelity(img: np.ndarray, ref: np.ndarray, scale: int, *, f_cut: float = 0.5,
+                      border: int = 0) -> float:
+    """Phase-sensitive fidelity of the detail above the native Nyquist.
+
+    ``1 - ||H (img - ref)||^2 / ||H ref||^2`` where ``H`` keeps the 2-D
+    spatial frequencies with ``max(|fx|, |fy|) > f_cut`` cycles per LR pixel
+    (default 0.5, the sensor's Nyquist) after cropping ``border`` pixels and
+    applying a separable Hann window to both images.  ``scale`` is the image
+    grid scale (the grid's Nyquist is ``0.5 scale`` cycles per LR px, so
+    ``scale`` must be at least 2).
+
+    1 means the detail the sensor grid cannot carry was recovered exactly,
+    0 means none was recovered (e.g. any interpolation of LR data, up to
+    its small spectral leakage), and a negative value means the image put
+    *wrong* energy there (noise, ringing or hallucinated/aliased detail).
+    Unlike MTF50 or bar resolvability, it cannot be raised by a prior that
+    merely sharpens edges or by aliased patterns at the wrong position,
+    because the error is measured against the truth's phase.  NaN if either
+    image has a non-finite pixel or ``ref`` has no high-band energy.
+    """
+    if scale < 2:
+        raise ValueError("highband_fidelity needs a grid of scale >= 2")
+    a = _crop(np.asarray(img, float), border)
+    b = _crop(np.asarray(ref, float), border)
+    if a.shape != b.shape:
+        raise ValueError(f"shape mismatch {a.shape} vs {b.shape}")
+    if not (np.isfinite(a).all() and np.isfinite(b).all()):
+        return float("nan")
+    win = np.outer(np.hanning(a.shape[0]), np.hanning(a.shape[1]))
+    mu = float(np.sum(b * win) / np.sum(win))
+    fy = np.fft.fftfreq(a.shape[0]) * scale  # cycles per LR px
+    fx = np.fft.fftfreq(a.shape[1]) * scale
+    high = np.maximum(np.abs(fy)[:, None], np.abs(fx)[None, :]) > f_cut
+    E = np.fft.fft2((a - b) * win)
+    R = np.fft.fft2((b - mu) * win)
+    denom = float(np.sum(np.abs(R[high]) ** 2))
+    if denom <= 0.0:
+        return float("nan")
+    return float(1.0 - np.sum(np.abs(E[high]) ** 2) / denom)
 
 
 # ---------------------------------------------------------------------------
