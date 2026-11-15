@@ -237,3 +237,47 @@ def test_out_of_bounds_warns(textured, clean_bab):
     with pytest.warns(RuntimeWarning, match="outside the HR canvas"):
         cap = simulate_capture(textured, clean_bab, trace_from_shifts([[5.0, 0.0]] * 2, clean_bab), None, 1, 0)
     assert cap.meta["oob_fraction"] > 0
+
+
+# Staggered exposure model -------------------------------------------------
+
+
+def test_staggered_exposure_equals_full_without_motion(chart):
+    """With no motion the exposure-timing model cannot matter."""
+    full = simulate_capture(chart, SensorConfig.bab(n_dead=2), None, None, 2, seed=3)
+    stag = simulate_capture(chart, SensorConfig.bab(n_dead=2, exposure="staggered"), None, None, 2, seed=3)
+    for a, b in zip(full.subpages, stag.subpages):
+        np.testing.assert_array_equal(a.mask, b.mask)
+        np.testing.assert_array_equal(a.values, b.values)
+
+
+def test_staggered_exposure_samples_each_pixel_at_its_readout_time(textured, clean_bab):
+    """Constant pan (dx = v t): under ``"staggered"`` each read pixel equals the
+    box sample of the scene at the shift of its own conversion time
+    (row-major readout order, window T / N), and ``true_shift`` is the mean
+    of those shifts.  Under ``"full"`` the same pixel is the exposure average."""
+    sensor = dataclasses.replace(clean_bab, exposure="staggered")
+    v = 2.0  # LR px per s
+    t = np.linspace(0.0, 1.0, 2001)
+    yaw = np.arctan(v * t / sensor.f_px[0])
+    trace = MotionTrace(t=t, theta=np.stack([yaw, np.zeros_like(t)], axis=1))
+    cap = simulate_capture(textured, sensor, trace, None, 1, seed=0)
+    T = sensor.subpage_period_s
+    for k, sp in enumerate(cap.subpages):
+        idx = np.flatnonzero(sp.mask.ravel())
+        N = idx.size
+        times = sp.t_start + (np.arange(N) + 0.5) * T / N
+        dx = sensor.f_px[0] * np.tan(np.interp(times, t, yaw))
+        for n in (0, N // 3, N - 1):
+            i, j = np.unravel_index(idx[n], sensor.shape)
+            ref = truth_at_scale(cap, 1, shift=(dx[n], 0.0))[i, j]
+            assert sp.values[i, j] == pytest.approx(ref, abs=1e-6)
+        assert sp.true_shift[0] == pytest.approx(dx.mean(), abs=1e-6)
+        assert abs(sp.true_shift[1]) < 1e-12
+    full = simulate_capture(textured, clean_bab, trace, None, 1, seed=0)
+    assert np.nanmax(np.abs(full.subpages[0].values - cap.subpages[0].values)) > 1e-3
+
+
+def test_unknown_exposure_rejected():
+    with pytest.raises(ValueError):
+        SensorConfig.bab(exposure="rolling")

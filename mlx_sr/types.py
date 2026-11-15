@@ -83,6 +83,19 @@ Subpage timing
     ``[k / refresh_hz, (k + 1) / refresh_hz)``.  ``n_frames`` in
     ``simulate_capture`` counts full frames, so ``K = 2 * n_frames`` subpages.
 
+Exposure model (``SensorConfig.exposure``; an *assumption*, the datasheet does
+not specify per-pixel conversion timing)
+    ``"full"`` (default): every read pixel of subpage ``k`` integrates the
+    scene over the whole subpage window, so motion faster than the subpage
+    rate (e.g. 8-12 Hz tremor at 8 Hz) averages into blur.  ``"staggered"``:
+    the read pixels are converted one after another in row-major readout
+    order, each over a short window of ``1 / (refresh_hz * n_read)``, so each
+    pixel sees its own pose (per-pixel pose jitter instead of blur).  In both
+    modes ``Subpage.true_shift`` is the mean shift over the subpage's
+    exposure (for ``"staggered"``, the mean over its read pixels' sampling
+    times).  The reconstruction operator assumes one shift per subpage, so
+    the staggered mode is also a model-mismatch test.
+
 Temperatures
     All image values are degrees Celsius.  Dead pixels read ``DEAD_VALUE``
     (-273.15) and are ``False`` in ``Subpage.mask``.
@@ -150,6 +163,7 @@ class SensorConfig:
     psf_sigma_px: float = 0.4  # Gaussian optics blur in LR px (unpublished; assumption)
     adc_lsb_k: float = 0.01  # output quantization step (assumption); 0 disables
     readout: Literal["chess", "interleaved"] = "chess"
+    exposure: Literal["full", "staggered"] = "full"  # per-pixel timing (assumption; see module docstring)
 
     def __post_init__(self) -> None:
         if self.variant not in ("BAA", "BAB"):
@@ -158,6 +172,8 @@ class SensorConfig:
             raise ValueError("refresh_hz must be within 0.5-64 Hz")
         if self.readout not in ("chess", "interleaved"):
             raise ValueError(f"unknown readout {self.readout!r}")
+        if self.exposure not in ("full", "staggered"):
+            raise ValueError(f"unknown exposure {self.exposure!r}")
         if min(self.netd_1hz_k, self.fpn_sigma_k, self.psf_sigma_px, self.adc_lsb_k) < 0:
             raise ValueError("noise, FPN, PSF and LSB parameters must be >= 0")
 

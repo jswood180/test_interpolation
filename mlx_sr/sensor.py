@@ -13,11 +13,17 @@ crime):
    (exact, not an approximation).  Without roll all pixels share one shift,
    so a subpage is ``B`` gathered through a bilinear-splat kernel of the
    exposure's shift samples.
-3. Motion blur: each subpage averages the footprint integral over its exposure
-   window ``[k/rate, (k+1)/rate)`` with a midpoint rule whose sample count
-   keeps the footprint step below ``EXPOSURE_STEP_PX`` (4 to
-   ``EXPOSURE_SAMPLES_HZ * T`` samples).  ``true_shift`` is the
-   average shift over the same samples.
+3. Motion blur: with ``sensor.exposure == "full"`` (default) each subpage
+   averages the footprint integral over its exposure window
+   ``[k/rate, (k+1)/rate)`` with a midpoint rule whose sample count keeps
+   the footprint step below ``EXPOSURE_STEP_PX`` (4 to
+   ``EXPOSURE_SAMPLES_HZ * T`` samples).  ``true_shift`` is the average shift
+   over the same samples.  With ``"staggered"`` the read pixels are
+   converted in row-major order, pixel ``n`` of ``N`` over
+   ``[k/rate + n T/N, k/rate + (n+1) T/N)`` (``STAGGER_SAMPLES`` midpoint
+   samples), each at its own pose; ``true_shift`` is the mean of the read
+   pixels' shifts.  Which model matches the hardware is not documented
+   (assumption; see :mod:`mlx_sr.types`).
 4. Readout: chess (or interleaved) subpage masks, ``subpage_id = k % 2``.
 5. Noise: static per-pixel FPN offsets ``N(0, fpn_sigma_k)``, temporal noise
    ``N(0, netd_1hz_k * sqrt(refresh_hz))``, quantization to ``adc_lsb_k``,
@@ -54,6 +60,7 @@ __all__ = [
     "box_sample",
     "EXPOSURE_SAMPLES_HZ",
     "EXPOSURE_STEP_PX",
+    "STAGGER_SAMPLES",
 ]
 
 EXPOSURE_SAMPLES_HZ: float = 2000.0
@@ -61,6 +68,9 @@ EXPOSURE_SAMPLES_HZ: float = 2000.0
 
 EXPOSURE_STEP_PX: float = 0.01
 """Target footprint displacement between consecutive motion-blur samples (LR px)."""
+
+STAGGER_SAMPLES: int = 2
+"""Midpoint samples per pixel window in the ``"staggered"`` exposure mode."""
 
 
 class _IntegralImage:
@@ -195,6 +205,38 @@ def _scene_geometry(scene_hr, sensor: SensorConfig) -> tuple[np.ndarray, int, in
     return img, hr, mr // 2, None
 
 
+def _staggered_signal(source, sensor: SensorConfig, B: np.ndarray, read: np.ndarray, t0: float,
+                      T: float, margin: int, hr: int) -> tuple[np.ndarray, np.ndarray, float]:
+    """Signal of one subpage under the ``"staggered"`` exposure model.
+
+    Read pixels are converted in row-major order; pixel ``n`` of ``N`` is
+    sampled at ``STAGGER_SAMPLES`` midpoints of
+    ``[t0 + n T / N, t0 + (n + 1) T / N)`` with its own pose (translation and
+    roll).  Returns ``(signal (rows, cols), true_shift (2,), oob_fraction)``;
+    unread pixels get the pose at the subpage midpoint (they are masked out).
+    """
+    rows, cols = sensor.shape
+    flat = read.ravel()
+    N = max(int(flat.sum()), 1)
+    order = np.where(flat, np.cumsum(flat) - 1, (N - 1) / 2.0).reshape(rows, cols).astype(float)
+    S = STAGGER_SAMPLES
+    frac = (np.arange(S) + 0.5) / S
+    ts = t0 + (order[None, :, :] + frac[:, None, None]) * (T / N)  # (S, rows, cols)
+    ang = source.angles_at(ts.ravel()).reshape(S, rows, cols, 3)
+    sh = _motion.angles_to_shift(ang[..., :2], sensor)  # (S, rows, cols, 2)
+    roll = ang[..., 2]
+    jj, iii = np.meshgrid(np.arange(cols, dtype=float), np.arange(rows, dtype=float))
+    cx, cy = cols / 2.0, rows / 2.0
+    c, s_ = np.cos(roll), np.sin(roll)
+    xc = cx + c * (jj + 0.5 - cx) - s_ * (iii + 0.5 - cy)
+    yc = cy + s_ * (jj + 0.5 - cx) + c * (iii + 0.5 - cy)
+    X0 = (xc - 0.5 + sh[..., 0] + margin) * hr
+    Y0 = (yc - 0.5 + sh[..., 1] + margin) * hr
+    m, out = _bilinear(B, X0, Y0)
+    true_shift = sh.mean(axis=0)[read].mean(axis=0)
+    return m.mean(axis=0), true_shift, float(np.mean(np.any(out, axis=0)[read]))
+
+
 def simulate_capture(scene_hr: np.ndarray | Scene, sensor: SensorConfig,
                      motion_cfg: MotionConfig | MotionTrace | None, gyro_cfg: GyroConfig | None,
                      n_frames: int, seed: int) -> Capture:
@@ -254,6 +296,20 @@ def simulate_capture(scene_hr: np.ndarray | Scene, sensor: SensorConfig,
     oob = []
     for k in range(K):
         t0, t1 = k * T, (k + 1) * T
+        sid = k % 2
+        read = masks[sid]
+        if sensor.exposure == "staggered":
+            signal, true_shift, oob_k = _staggered_signal(source, sensor, B, read, t0, T, margin, hr)
+            oob.append(oob_k)
+            noise = rng_noise.standard_normal((rows, cols)) * sigma_n
+            vals = signal + fpn + noise
+            if sensor.adc_lsb_k > 0:
+                vals = np.round(vals / sensor.adc_lsb_k) * sensor.adc_lsb_k
+            vals = np.where(read, vals, np.nan)
+            vals[read & dead_mask] = DEAD_VALUE
+            subpages.append(Subpage(values=vals, mask=read & ~dead_mask, subpage_id=sid,
+                                    t_start=t0, t_end=t1, frame_index=k // 2, true_shift=true_shift))
+            continue
         n_sub = _n_exposure_samples(source, sensor, t0, T)
         ts = t0 + (np.arange(n_sub) + 0.5) / n_sub * T
         ang = source.angles_at(ts)  # (n_sub, 3)
@@ -281,8 +337,6 @@ def simulate_capture(scene_hr: np.ndarray | Scene, sensor: SensorConfig,
             bad = (np.abs(shifts[:, 0]) > margin) | (np.abs(shifts[:, 1]) > margin)
             oob.append(float(np.mean(bad)))
 
-        sid = k % 2
-        read = masks[sid]
         noise = rng_noise.standard_normal((rows, cols)) * sigma_n
         vals = signal + fpn + noise
         if sensor.adc_lsb_k > 0:
