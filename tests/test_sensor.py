@@ -140,6 +140,8 @@ def test_f4_px_per_degree():
     ah, av = SensorConfig.baa().px_per_deg
     assert abs(bh - 0.54) <= 0.02 and abs(bv - 0.66) <= 0.02
     assert abs(ah - 0.20) <= 0.02 and abs(av - 0.27) <= 0.02
+    assert SensorConfig.bab().netd_1hz_k == 0.25 and SensorConfig.baa().netd_1hz_k == 0.14
+    assert SensorConfig.bab(netd_1hz_k=0.3).netd_1hz_k == 0.3
     fx, fy = SensorConfig.bab().f_px
     assert fx == pytest.approx(16 / np.tan(np.radians(27.5)))
     assert fy == pytest.approx(12 / np.tan(np.radians(17.5)))

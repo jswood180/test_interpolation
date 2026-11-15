@@ -134,14 +134,17 @@ class SensorConfig:
     """MLX90640 sensor model parameters.
 
     Defaults marked *assumption* are not taken from a datasheet and should be
-    swept in experiments.
+    swept in experiments.  NETD defaults are the per-variant averages from
+    datasheet Table 14 (BAB 0.25 K, BAA 0.14 K at 1 Hz); the sqrt(rate)
+    scaling and the flat (non-vignetted) noise across the array are
+    assumptions.  The chess parity (pixel (0, 0) in subpage 0) is assumed.
     """
 
     variant: Literal["BAA", "BAB"] = "BAB"
     fov_deg: tuple[float, float] = (55.0, 35.0)  # (horizontal, vertical)
     shape: tuple[int, int] = LR_SHAPE  # (rows, cols)
     refresh_hz: float = 8.0  # subpage rate, 0.5-64 Hz
-    netd_1hz_k: float = 0.1  # RMS noise at 1 Hz refresh (datasheet BAB figure)
+    netd_1hz_k: float = 0.25  # RMS noise at 1 Hz refresh; datasheet Table 14 average (BAB 0.25, BAA 0.14)
     fpn_sigma_k: float = 0.1  # residual per-pixel offset after calibration (assumption)
     n_dead: int = 0  # datasheet allows up to 4 defective pixels
     psf_sigma_px: float = 0.4  # Gaussian optics blur in LR px (unpublished; assumption)
@@ -161,14 +164,14 @@ class SensorConfig:
     @classmethod
     def bab(cls, **overrides: Any) -> "SensorConfig":
         """MLX90640ESF-BAB: 55 x 35 deg FOV."""
-        kw: dict[str, Any] = dict(variant="BAB", fov_deg=(55.0, 35.0))
+        kw: dict[str, Any] = dict(variant="BAB", fov_deg=(55.0, 35.0), netd_1hz_k=0.25)
         kw.update(overrides)
         return cls(**kw)
 
     @classmethod
     def baa(cls, **overrides: Any) -> "SensorConfig":
         """MLX90640ESF-BAA: 110 x 75 deg FOV."""
-        kw: dict[str, Any] = dict(variant="BAA", fov_deg=(110.0, 75.0))
+        kw: dict[str, Any] = dict(variant="BAA", fov_deg=(110.0, 75.0), netd_1hz_k=0.14)
         kw.update(overrides)
         return cls(**kw)
 
