@@ -12,7 +12,7 @@ Research notes for a Python prototype that improves the resolution of the MLX906
 ## 1. Summary
 
 - Multi-frame super-resolution (SR) combines frames that are offset by sub-pixel amounts into one image on a finer grid. Commercial thermal cameras do this with natural hand motion: [FLIR UltraMax](https://www.transcat.ca/media/pdf/FLIR-ULTRAMAX-thermal-imager-application-note.pdf) and [Testo SuperResolution](https://www.testo.com/en-SE/testo-superresolution/p/0554-7806).
-- Vendor claims are 2x linear resolution (4x pixels) from FLIR and 1.6x geometric resolution from Testo. Independent verification is weak ([arXiv 2608.02404](https://arxiv.org/pdf/2608.02404)). Hobbyist tests show modest gains ([EEVblog thread](https://www.eevblog.com/forum/thermal-imaging/improving-thermal-sensor-resolution-by-vibratingmoving-sensor-while-shooting/)).
+- Vendor claims are 2x linear resolution (4x pixels) from FLIR and 1.6x geometric resolution from Testo. Independent verification is weak: the one preprint found only a marginal gain, measured as photogrammetric tie-point yield ([arXiv 2608.02404](https://arxiv.org/pdf/2608.02404)). Hobbyist tests show modest gains ([EEVblog thread](https://www.eevblog.com/forum/thermal-imaging/improving-thermal-sensor-resolution-by-vibratingmoving-sensor-while-shooting/)).
 - **The biggest MLX90640-specific risk:** its instantaneous field of view (IFOV) is very coarse, about 1.7–3.4°/px [my calc from the [datasheet](https://media.melexis.com/-/media/files/documents/datasheets/MLX90640-datasheet-melexis.pdf)]. Natural hand tremor alone may move the image by only a few hundredths of a pixel. Plan for deliberate wobble ([section 7](#7-pitfalls)).
 - **Chess-mode readout** samples the two halves of each frame at different times. The SR model must treat each subpage as its own observation ([section 2.2](#22-chess-subpages-and-the-adafruit-driver)).
 - **Recommended pipeline [recommendation]:**
@@ -80,12 +80,12 @@ Two pages, June 2020: [page 1](https://www.eevblog.com/forum/thermal-imaging/imp
 
 ### 3.2 FLIR UltraMax
 
-Sources: [product page](https://www.flir.com/discover/rd-science/ultramax--the-ultimate-resolution/), [technical note](https://www.transcat.ca/media/pdf/FLIR-ULTRAMAX-thermal-imager-application-note.pdf).
+Sources: [technical note](https://www.transcat.ca/media/pdf/FLIR-ULTRAMAX-thermal-imager-application-note.pdf) (the source for every figure, example and limitation below) and [product page](https://www.flir.com/discover/rd-science/ultramax--the-ultimate-resolution/) (which only says "up to four times as many pixels" and gives 640x480 → 1280x960).
 
-- **How it works.** It captures **16 frames in under 1 s**, stored as one JPG and merged in FLIR software. It uses "the natural movement of the human body" to offset the frames.
+- **How it works.** It captures **16 thermal images in less than one second** (technical note), stored as one JPG and merged in FLIR software. It uses "the natural movement of the human body" to offset the frames.
 - **Claims:**
-  - **2x resolution and 4x pixels** (320x240 → 640x480, 640x480 → 1280x960).
-  - **"50% less noise."**
+  - **2x resolution and 4x pixels** (320x240 → 640x480, 640x480 → 1280x960). The technical note says "twice the original resolution and four times as many pixels"; the product page supports only the 4x pixel claim.
+  - **"50% less noise"** (technical note; not on the product page).
   - Radiometric data is retained.
   - Smaller measurement spot size. In FLIR's example a 120°F target reads 98°F natively and 118°F with UltraMax.
 - **Stated limitations:**
@@ -97,8 +97,8 @@ Sources: [product page](https://www.flir.com/discover/rd-science/ultramax--the-u
 
 ### 3.3 Testo SuperResolution and independent checks
 
-- Testo claims usable geometric resolution improved "by a factor of 1.6" with four times as many measuring values ([Testo](https://www.testo.com/en-SE/testo-superresolution/p/0554-7806)).
-- A 2026 preprint found only a "marginal" improvement from UltraMax. It says UltraMax has never been independently verified in the peer-reviewed literature, and its loosened-tripod capture may not reproduce real use ([arXiv 2608.02404](https://arxiv.org/pdf/2608.02404); I saw it only via a search summary).
+- Testo says SuperResolution improves geometric resolution "by a factor of 1.6" ([Testo UK portal](https://portal.testo.com/en-UK/products/thermography-superresolution)) and gives four times more measurement values (reseller wording). The originally cited [Testo en-SE page](https://www.testo.com/en-SE/testo-superresolution/p/0554-7806) could not be fetched for verification **[unverified]**.
+- A 2026 preprint that compared native, UltraMax and AI-upscaled thermal images in a photogrammetry pipeline found only a "marginal improvement in tie-point yield" from UltraMax and called its magnitude "modest". It says UltraMax has "never been independently verified in the peer-reviewed literature", and that its loosened-tripod capture may not reproduce the displacement of real hand tremor ([arXiv 2608.02404](https://arxiv.org/pdf/2608.02404)).
 - A figure of "~1.4–2x effective resolution" for UltraMax is sometimes quoted. I found no source for it **[unverified]**.
 
 ---
@@ -241,6 +241,7 @@ For the kernel-regression merge, see the unofficial Python implementation of [Wr
 8. **BAA lens distortion** makes shifts non-uniform across the field **[unverified]**. Use a calibrated or per-region motion model.
 9. **Over-regularization.** BTV can flatten small hot-spot peaks. Always report radiometric error.
 10. **No aliasing, no gain.** If the optics blur beyond the pixel pitch, SR reduces to denoising. Measure the PSF first.
+11. **Per-pixel exposure timing is undocumented [unverified].** The datasheet gives the subpage rate but not whether every pixel of a subpage integrates over the whole subpage period, or whether the multiplexed ADC converts pixels one after another over short windows. In the first case motion faster than the subpage rate (8–12 Hz tremor at an 8 Hz subpage rate) averages into blur; in the second each pixel samples its own pose (per-pixel jitter, a rolling-shutter-like distortion). The prototype simulates both (`SensorConfig.exposure = "full" | "staggered"`) and its conclusions are reported for both; measure it on hardware (for example with a fast pan across a sharp edge).
 
 ---
 
@@ -248,8 +249,8 @@ For the kernel-regression merge, see the unofficial Python implementation of [Wr
 
 - **Estimate [unverified, my synthesis]:** about **1.3–1.8x effective linear resolution in the best case**. That assumes aliased optics, good registration, a static scene and enough sub-pixel diversity. Expect less if the PSF is wide.
 - **Evidence behind it:**
-  - Vendor claims: 2x ([FLIR](https://www.transcat.ca/media/pdf/FLIR-ULTRAMAX-thermal-imager-application-note.pdf)) and 1.6x ([Testo](https://www.testo.com/en-SE/testo-superresolution/p/0554-7806)).
-  - Weak independent results: [arXiv 2608.02404](https://arxiv.org/pdf/2608.02404) and the [EEVblog tests](https://www.eevblog.com/forum/thermal-imaging/improving-thermal-sensor-resolution-by-vibratingmoving-sensor-while-shooting/).
+  - Vendor claims: 2x ([FLIR technical note](https://www.transcat.ca/media/pdf/FLIR-ULTRAMAX-thermal-imager-application-note.pdf)) and 1.6x ([Testo UK portal](https://portal.testo.com/en-UK/products/thermography-superresolution)).
+  - Weak independent results: a marginal photogrammetric gain ([arXiv 2608.02404](https://arxiv.org/pdf/2608.02404)) and the [EEVblog tests](https://www.eevblog.com/forum/thermal-imaging/improving-thermal-sensor-resolution-by-vibratingmoving-sensor-while-shooting/).
   - Theoretical limits on magnification ([Baker & Kanade 2002](https://ri.cmu.edu/publications/limits-on-super-resolution-and-how-to-break-them)).
 - **Success criterion [recommendation]:** a measurable MTF50 or bar-target gain over a *registered multi-frame average + bicubic*, not merely over single-frame bicubic.
 
@@ -278,7 +279,7 @@ For the kernel-regression merge, see the unofficial Python implementation of [Wr
 
 **Primary sources reviewed**
 1. EEVblog Forum, "Improving thermal sensor resolution by vibrating/moving sensor while shooting," 2020. [Page 1](https://www.eevblog.com/forum/thermal-imaging/improving-thermal-sensor-resolution-by-vibratingmoving-sensor-while-shooting/), [Page 2](https://www.eevblog.com/forum/thermal-imaging/improving-thermal-sensor-resolution-by-vibratingmoving-sensor-while-shooting/25/)
-2. FLIR, "UltraMax – the Ultimate Resolution" (product page). <https://www.flir.com/discover/rd-science/ultramax--the-ultimate-resolution/>
+2. FLIR, "UltraMax – the Ultimate Resolution" (product page; pixel-count claim only, no frame count, noise figure, example or limitations). <https://www.flir.com/discover/rd-science/ultramax--the-ultimate-resolution/>
 3. FLIR, "UltraMax – The Ultimate Resolution" technical note. <https://www.transcat.ca/media/pdf/FLIR-ULTRAMAX-thermal-imager-application-note.pdf>
 
 **Sensor and drivers**
@@ -292,7 +293,7 @@ For the kernel-regression merge, see the unofficial Python implementation of [Wr
 
 **Commercial claims and verification**
 
-10. Testo, SuperResolution. <https://www.testo.com/en-SE/testo-superresolution/p/0554-7806>
+10. Testo, SuperResolution. <https://www.testo.com/en-SE/testo-superresolution/p/0554-7806> (could not be fetched for verification); Testo UK portal: <https://portal.testo.com/en-UK/products/thermography-superresolution>
 11. "Loggia dei Lanzi: AI Thermography Enhancement Comparisons through 3D Photogrammetry," arXiv 2608.02404. <https://arxiv.org/pdf/2608.02404>
 
 **Super-resolution algorithms**
