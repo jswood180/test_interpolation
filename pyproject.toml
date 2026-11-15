@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.26",
-    "scipy>=1.11",
+    "scipy>=1.11.2",  # first release with Python 3.12 wheels
     "scikit-image>=0.22",
     "matplotlib>=3.8",
 ]

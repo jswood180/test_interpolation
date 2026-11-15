@@ -129,17 +129,34 @@ def _btv_and_zero_shift_twin(chart_scene, sensor, s, seed, **kw):
     return out
 
 
-@pytest.mark.parametrize("shift_seed,noise_seed", [(0, 100), (2, 102)])
-def test_s1_gain_requires_subpixel_shifts(chart_scene, shift_seed, noise_seed):
+PAIRED_SEEDS = range(8)
+"""Shift draws ``k`` with noise seeds ``100 + k`` for the paired S1/S4 controls."""
+
+
+def _paired_differences(chart_scene, sensor, **kw) -> tuple[np.ndarray, np.ndarray]:
+    """Per-pair ``(PSNR, HF)`` differences BTV(shifts) - BTV(zero-shift twin)."""
+    dp, dh = [], []
+    for k in PAIRED_SEEDS:
+        (p, hf), (p0, hf0) = _btv_and_zero_shift_twin(chart_scene, sensor, _shifts(k), 100 + k, **kw)
+        dp.append(p - p0)
+        dh.append(hf - hf0)
+    return np.asarray(dp), np.asarray(dh)
+
+
+def test_s1_gain_requires_subpixel_shifts(chart_scene):
     """S1, paired control: the same capture with zero shifts (same noise and
-    fixed pattern) isolates the super-resolution part of the S1 gain.  With
-    the known S1 shifts BTV beats its zero-shift twin by >= 1 dB and puts
-    more correct detail above native Nyquist (high-band fidelity +0.1).
-    (Measured: about +1.9 dB; HF about 0.32-0.35 vs 0.11-0.12.)"""
+    fixed pattern) isolates the super-resolution part of the S1 gain.
+    Single pairs vary a lot (measured over shift draws k = 0-7 with noise
+    seeds 100 + k: PSNR difference -0.07 to +1.93 dB, high-band fidelity
+    difference +0.04 to +0.25), so the assertion is on the mean over the 8
+    pairs (measured: +1.40 dB, sd 0.70; HF +0.146, sd 0.078), with
+    thresholds about 2.7 standard errors below the measured means.  Most
+    pairs must also gain HF."""
     sensor = SensorConfig.bab(psf_sigma_px=0.4, refresh_hz=8.0)
-    (p, hf), (p0, hf0) = _btv_and_zero_shift_twin(chart_scene, sensor, _shifts(shift_seed), noise_seed)
-    assert p >= p0 + 1.0, (p, p0)
-    assert hf >= hf0 + 0.1, (hf, hf0)
+    dp, dh = _paired_differences(chart_scene, sensor)
+    assert dp.mean() >= 0.7, dp
+    assert dh.mean() >= 0.07, dh
+    assert np.sum(dh > 0) >= 7, dh
 
 
 def test_nc_and_ibp_improve_on_bicubic(s1_case, chart_scene):
@@ -230,14 +247,17 @@ def test_s4_psf_mismatch_still_beats_bicubic(chart_scene):
 def test_s4_psf_mismatch_paired_control(chart_scene):
     """S4, paired control: with the PSF mismatched (0.6 simulated, 0.4
     assumed) the shifts still help PSNR over the zero-shift twin, but the
-    high-band fidelity gain of S1 disappears.  (Measured: about +0.4 dB;
-    HF about 0.05 vs 0.05.)  A wrong PSF assumption erases most of the
-    super-resolution, which the README reports; this test pins that
-    behavior so a change in either direction is noticed."""
+    high-band fidelity gain shrinks to a fraction of S1's.  Over the same 8
+    pairs as S1 (measured: PSNR +0.39 dB, sd 0.18, per pair +0.16 to
+    +0.62; HF +0.030, sd 0.046, per pair -0.02 to +0.12) the mean PSNR
+    gain stays positive and the mean HF gain stays well below S1's.  A wrong
+    PSF assumption erases most of the super-resolution, which the README
+    reports; this test pins that behavior so a change in either direction is
+    noticed."""
     sensor = SensorConfig.bab(psf_sigma_px=0.6, refresh_hz=8.0)
-    (p, hf), (p0, hf0) = _btv_and_zero_shift_twin(chart_scene, sensor, _shifts(1), 101, psf_sigma=0.4)
-    assert p > p0 + 0.1, (p, p0)
-    assert abs(hf - hf0) < 0.1, (hf, hf0)
+    dp, dh = _paired_differences(chart_scene, sensor, psf_sigma=0.4)
+    assert dp.mean() > 0.15, dp
+    assert abs(dh.mean()) < 0.09, dh
 
 
 # Baselines, alignment and API ------------------------------------------------

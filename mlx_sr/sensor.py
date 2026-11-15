@@ -353,7 +353,10 @@ def simulate_capture(scene_hr: np.ndarray | Scene, sensor: SensorConfig,
 
     oob_fraction = float(np.mean(oob)) if oob else 0.0
     if oob_fraction > 0:
-        warnings.warn(f"{oob_fraction:.1%} of exposure samples had footprints outside the HR canvas; "
+        what = ("of exposure-time samples (all pixels share one shift) had footprints"
+                if sensor.exposure == "full"
+                else "of read pixels had at least one sample with a footprint")
+        warnings.warn(f"{oob_fraction:.1%} {what} outside the HR canvas (averaged over subpages); "
                       "increase margin_lr or reduce motion", RuntimeWarning, stacklevel=2)
 
     meta = dict(scene=scene_meta, seed=seed, n_frames=n_frames, duration_s=duration,

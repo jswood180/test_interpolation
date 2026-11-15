@@ -86,7 +86,10 @@ average, ``bar_ratio`` = ``bar_limit_freq[method] / bar_limit_freq[bicubic]``,
 ``motion_bar_ratio`` likewise for the bar limit and ``motion_hf_gain`` =
 ``hf_fidelity[method] - hf_fidelity[method@still]``.  With the no-spread
 control: ``spread_gain_db`` = ``psnr[method] - psnr[method@nospread]``,
-``spread_hf_gain`` likewise for ``hf_fidelity``, ``nospread_residual_px``
+``spread_hf_gain`` likewise for ``hf_fidelity`` (both include the
+registration error, since the twin needs no registration),
+``spread_gain_oracle_db`` / ``spread_hf_gain_oracle`` (the same with the
+method on true shifts), ``nospread_residual_px``
 (the twin's remaining spread) and, with both controls,
 ``within_exposure_db`` / ``within_exposure_hf`` = no-spread minus still.
 """
@@ -362,7 +365,12 @@ def run_case(scene: Scene, sensor: SensorConfig, motion_cfg: MotionConfig | None
     ``nospread_control`` likewise adds a no-spread twin
     (:func:`nospread_trace`: the same within-exposure motion with the
     subpage-to-subpage motion removed), ``metrics["<method>@nospread"]``
-    and the ``spread_*`` / ``within_exposure_*`` summary values.
+    and the ``spread_*`` / ``within_exposure_*`` summary values.  The twins
+    are reconstructed on their true shifts, so ``spread_gain_db`` (method on
+    *estimated* shifts minus the twin) also contains the registration error;
+    ``spread_gain_oracle_db`` / ``spread_hf_gain_oracle`` (method on true
+    shifts minus the twin, when ``oracle`` includes the method) are the
+    like-for-like spread effect.
     """
     t0 = time.perf_counter()
     cap = simulate_capture(scene, sensor, motion_cfg, gyro_cfg, n_frames, seed)
@@ -402,6 +410,7 @@ def run_case(scene: Scene, sensor: SensorConfig, motion_cfg: MotionConfig | None
         twin = simulate_capture(scene, sensor, nospread_trace(cap), None, n_frames, seed)
         ctl = run_pipeline(twin, None, method, scale, ref_index=ref_index, baselines=(),
                            oracle=names, recon_kw=pipeline_kw.get("recon_kw"),
+                           keep_curves=pipeline_kw.get("keep_curves", False),
                            keep_images=pipeline_kw.get("keep_images", False))
         for nm in names:
             res["metrics"][f"{nm}@nospread"] = ctl["metrics"][f"{nm}@true"]
@@ -412,6 +421,10 @@ def run_case(scene: Scene, sensor: SensorConfig, motion_cfg: MotionConfig | None
         res["nospread_residual_px"] = ctl["shift_spread_px"]
         res["spread_gain_db"] = float(m["psnr"] - m_ns["psnr"])
         res["spread_hf_gain"] = float(m["hf_fidelity"] - m_ns["hf_fidelity"])
+        if f"{method}@true" in res["metrics"]:  # like for like: both on true shifts
+            m_tr = res["metrics"][f"{method}@true"]
+            res["spread_gain_oracle_db"] = float(m_tr["psnr"] - m_ns["psnr"])
+            res["spread_hf_gain_oracle"] = float(m_tr["hf_fidelity"] - m_ns["hf_fidelity"])
         if f"{method}@still" in res["metrics"]:
             m_st = res["metrics"][f"{method}@still"]
             res["within_exposure_db"] = float(m_ns["psnr"] - m_st["psnr"])
@@ -449,7 +462,8 @@ def nospread_trace(capture: Capture, samples_per_subpage: int = 500) -> MotionTr
 _SUMMARY_KEYS = ("effective_gain", "effective_gain_vs_average", "bar_ratio", "psnr_gain_db",
                  "psnr_gain_vs_average_db", "hf_gain", "oracle_gap_db", "motion_gain_db",
                  "motion_mtf_ratio", "motion_bar_ratio", "motion_hf_gain", "spread_gain_db",
-                 "spread_hf_gain", "within_exposure_db", "within_exposure_hf", "nospread_residual_px")
+                 "spread_hf_gain", "spread_gain_oracle_db", "spread_hf_gain_oracle", "within_exposure_db",
+                 "within_exposure_hf", "nospread_residual_px")
 
 
 def flatten_result(res: dict[str, Any]) -> dict[str, Any]:
