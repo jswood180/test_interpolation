@@ -49,6 +49,23 @@ walk, bias-drift, time-offset and floor error; fused hybrid frames add the
 two precisions.  The reference subpage gets ``CONF_REF``.
 ``info["sigma_px"] = 1 / sqrt(confidence)``.
 
+Failure modes (measured in simulation)
+--------------------------------------
+- Fixed-pattern locking: FPN is sensor-locked, so it pulls every subpage
+  toward zero shift relative to the reference.  On low-contrast scenes it
+  biases the image-derived gyro-bias fit; the hybrid's FPN-estimation pass
+  removes part of it (low-contrast 0.15 K-noise case: hybrid RMS
+  0.13-0.19 px without it, 0.04-0.12 px with it).
+- Weak images: at 0.3 K contrast with the default 8 Hz BAB noise the image
+  shifts are garbage (2-3.5 px RMS, phase peaks anywhere) and every
+  confidence is 0; the hybrid then returns the uncorrected gyro, whose
+  error is the unknown bias drift (0.2-1 px over 2 s for a 0.05-1 deg/s
+  bias).  At intermediate SNR (images good to about 0.3-0.5 px but
+  confidence still 0) this raw gyro can be worse than image-only ``"gn"``.
+- Time offset: only observable when the motion has enough rate content
+  (wobble, strong tremor at high refresh); with natural motion at 8 Hz the
+  estimate is rejected and the prior (0) is used.
+
 Inverse-crime guard: only ``capture.subpages``, ``capture.gyro`` (stamps
 and rates, not its truth fields ``bias`` / ``time_offset_s``) and
 ``capture.sensor`` (datasheet-like configuration) are used here, never
@@ -57,6 +74,7 @@ and rates, not its truth fields ``bias`` / ``time_offset_s``) and
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import warnings
 from typing import Callable, Literal
@@ -625,11 +643,14 @@ def estimate_time_offset(image_shifts: np.ndarray, sub_t: np.ndarray, gyro: Gyro
     tau, or ``(tau, info)`` when ``return_info``, with ``info = {"peak":
     score at the peak, "sd": predicted standard error of tau (s), "taus":
     grid, "scores": scores, "at_edge": peak on the search boundary}``.
-    ``sd`` is ``1 / sqrt(sum_k w_k |d g_k / d tau|^2)`` with the gyro
-    shifts' tau-derivative prepared like the signals; it is only meaningful
-    when ``weights`` are calibrated precisions (px^-2, e.g.
-    ``Registration.confidence``).  A high correlation peak alone does not
-    mean tau is observable: slow drift correlates well at any tau.
+    ``sd`` is ``sqrt(max(chi2_red, 1) / sum_k w_k |beta d g_k / d tau|^2)``
+    with the gyro shifts' tau-derivative prepared like the signals, ``beta``
+    the fitted gain and ``chi2_red`` the weighted reduced chi-square of the
+    residual ``image - beta g(tau)`` (so optimistic or unit weights are
+    rescaled by the actual scatter).  Weights at or above ``CONF_REF`` (the
+    reference subpage) are replaced by the largest other weight.  A high
+    correlation peak alone does not mean tau is observable: slow drift
+    correlates well at any tau.
     """
     s = np.asarray(image_shifts, dtype=float).reshape(-1, 2)
     windows = _windows_from_times(sub_t)
@@ -639,6 +660,9 @@ def estimate_time_offset(image_shifts: np.ndarray, sub_t: np.ndarray, gyro: Gyro
         raise ValueError(f"unknown domain {domain!r}")
     K = s.shape[0]
     w = np.ones(K) if weights is None else np.clip(np.asarray(weights, float), 0.0, None)
+    big = w >= CONF_REF  # the reference's nominal confidence is not a measurement precision
+    if big.any():
+        w = np.where(big, w[~big].max() if (~big).any() else 1.0, w)
     mid = windows.mean(axis=1)
     scale = sensor.f_px if sensor is not None else (1.0, 1.0)
     integ = _GyroIntegrator(gyro)
@@ -678,10 +702,20 @@ def estimate_time_offset(image_shifts: np.ndarray, sub_t: np.ndarray, gyro: Gyro
         den = y0 - 2 * y1 + y2
         if den < 0:
             tau += float(np.clip(0.5 * (y0 - y2) / den, -0.5, 0.5)) * step
+    # Standard error from the weighted least-squares view: Fisher information
+    # of the fitted model beta * g(tau), inflated by the reduced chi-square of
+    # the residuals when the weights are optimistic.
+    sg = prep(integ.shifts(windows, tau, scale))
+    den_b = float(np.sum(ww[:, None] * sg * sg))
+    beta = float(np.sum(ww[:, None] * si * sg)) / den_b if den_b > 0 else 1.0
+    resid = si - beta * sg
+    n_used = int((ww > 0).sum())
+    dof = max(2 * n_used - (5 if domain == "levels" else 3), 1)
+    chi2 = float(np.sum(ww[:, None] * resid * resid)) / dof
     d = 1e-3
-    dg = (prep(integ.shifts(windows, tau + d, scale)) - prep(integ.shifts(windows, tau - d, scale))) / (2 * d)
+    dg = beta * (prep(integ.shifts(windows, tau + d, scale)) - prep(integ.shifts(windows, tau - d, scale))) / (2 * d)
     fisher = float(np.sum(ww[:, None] * dg * dg))
-    sd = 1.0 / math.sqrt(fisher) if fisher > 0 else float("inf")
+    sd = math.sqrt(max(chi2, 1.0) / fisher) if fisher > 0 else float("inf")
     info = dict(peak=float(scores[k]), sd=sd, taus=taus, scores=scores,
                 at_edge=bool(k == 0 or k == taus.size - 1))
     return (tau, info) if return_info else tau
@@ -737,10 +771,11 @@ def _single_pass(capture: Capture, ref_index: int, init: np.ndarray | None, *, f
 
 def _stack_pass(capture: Capture, ref_index: int, stack_shifts: np.ndarray, stack_weights: np.ndarray,
                 init: np.ndarray, *, stack_sigma: float, iters: int, tol: float, max_shift: float,
-                noise_var: tuple[float, float]):
+                noise_var: tuple[float, float], subpages: list[Subpage] | None = None):
     """Gauss-Newton of every subpage (reference included) against a leave-one-out
-    multi-frame reference, then re-anchored so the reference subpage is zero."""
-    sps = capture.subpages
+    multi-frame reference, then re-anchored so the reference subpage is zero.
+    ``subpages`` overrides ``capture.subpages`` (e.g. FPN-corrected copies)."""
+    sps = capture.subpages if subpages is None else subpages
     K = len(sps)
     st = _StackReference(sps, stack_shifts, stack_weights, capture.sensor.shape, stack_sigma)
     Hn = st.noise_hessian(noise_var)
@@ -752,6 +787,39 @@ def _stack_pass(capture: Capture, ref_index: int, stack_shifts: np.ndarray, stac
     shifts = shifts - shifts[ref_index]
     conf[ref_index] = CONF_REF
     return shifts, conf
+
+
+def _estimate_fpn(subpages: list[Subpage], shifts: np.ndarray, shape: tuple[int, int], stack_sigma: float,
+                  noise_var: tuple[float, float]) -> tuple[np.ndarray, float]:
+    """Wiener-shrunk fixed-pattern estimate from residuals against the multi-frame reference.
+
+    For each subpage the leave-one-out reference is sampled at its shift and
+    the mean-free residual is averaged per sensor pixel; the average is
+    shrunk by ``s_f^2 / (s_f^2 + s_t^2 / n_reads)`` and made zero-mean.
+    Returns ``(fpn_hat, residual_fpn_var)`` where the residual variance is the
+    Wiener MMSE ``s_f^2 (1 - shrink)`` averaged over the array.  With small
+    motion the scene and the pattern are only partly separable, so this is a
+    partial correction.
+    """
+    t_var, f_var = noise_var
+    if f_var <= 0:
+        return np.zeros(shape), 0.0
+    st = _StackReference(subpages, shifts, np.ones(len(subpages)), shape, stack_sigma)
+    acc = np.zeros(shape)
+    cnt = np.zeros(shape)
+    for k, sp in enumerate(subpages):
+        m = sp.mask & np.isfinite(sp.values)
+        ii, jj = np.nonzero(m)
+        fn = spline_interpolant(st.image(exclude=k))
+        r = sp.values[ii, jj] - fn(jj + shifts[k][0], ii + shifts[k][1])
+        acc[ii, jj] += r - r.mean()
+        cnt[ii, jj] += 1
+    with np.errstate(invalid="ignore", divide="ignore"):
+        raw = np.where(cnt > 0, acc / np.maximum(cnt, 1), 0.0)
+        shrink = np.where(cnt > 0, f_var / (f_var + t_var / np.maximum(cnt, 1)), 0.0)
+    fpn = shrink * raw
+    fpn -= fpn[cnt > 0].mean() if (cnt > 0).any() else 0.0
+    return fpn, float(f_var * np.mean(1.0 - shrink))
 
 
 def _image_gn(capture: Capture, ref_index: int, init: np.ndarray | None, *, fill_sigma: float = 0.7,
@@ -774,9 +842,20 @@ def _image_gn(capture: Capture, ref_index: int, init: np.ndarray | None, *, fill
     return shifts, conf, dict(init=inits)
 
 
+def _phase_result(R: _Reference, values: np.ndarray, mask: np.ndarray, s: np.ndarray,
+                  max_shift: float) -> tuple[np.ndarray, float]:
+    """Confidence of a phase-correlation shift (GN Hessian at ``s``, no update);
+    a peak beyond ``max_shift`` (typical of pure noise) is clipped with zero confidence."""
+    if float(np.hypot(*s)) > max_shift:
+        return _clip_norm(s, max_shift), 0.0
+    _, c = gauss_newton_translation(R.fn, values, mask, s, iters=0, noise_hessian=R.noise_hessian)
+    return s, c
+
+
 def _register_phase(capture: Capture, ref_index: int, *, merged: bool = False,
                     upsample_factor: int = 20, iters: int = 3, fill_sigma: float = 0.7,
-                    ref_blur: float = 0.6, noise_sigma_k: float | None = None) -> Registration:
+                    ref_blur: float = 0.6, max_shift: float = 4.0,
+                    noise_sigma_k: float | None = None) -> Registration:
     sps = capture.subpages
     K = len(sps)
     shifts = np.zeros((K, 2))
@@ -796,8 +875,7 @@ def _register_phase(capture: Capture, ref_index: int, *, merged: bool = False,
                 fconf[n] = CONF_REF
                 continue
             s = phase_correlation(ref_filled, fill_masked(vals, mask, fill_sigma), upsample_factor, iters=iters)
-            _, c = gauss_newton_translation(R.fn, vals, mask, s, iters=0, noise_hessian=R.noise_hessian)
-            fshift[n], fconf[n] = s, c
+            fshift[n], fconf[n] = _phase_result(R, vals, mask, s, max_shift)
         for k, sp in enumerate(sps):
             shifts[k] = fshift[pos[sp.frame_index]]
             conf[k] = fconf[pos[sp.frame_index]]
@@ -810,8 +888,7 @@ def _register_phase(capture: Capture, ref_index: int, *, merged: bool = False,
                 conf[k] = CONF_REF
                 continue
             s = phase_correlation(ref_filled, fill_subpage(sp, fill_sigma), upsample_factor, iters=iters)
-            _, c = gauss_newton_translation(R.fn, sp.values, sp.mask, s, iters=0, noise_hessian=R.noise_hessian)
-            shifts[k], conf[k] = s, c
+            shifts[k], conf[k] = _phase_result(R, sp.values, sp.mask, s, max_shift)
     shifts[ref_index] = 0.0
     conf[ref_index] = CONF_REF
     return Registration(shifts=shifts, confidence=conf, method="phase",
@@ -872,44 +949,63 @@ def _fit_bias(resid: np.ndarray, t_rel: np.ndarray, w: np.ndarray, use: np.ndarr
 
 
 def _estimate_bias(gn_s: np.ndarray, gn_c: np.ndarray, g0: np.ndarray, t_rel: np.ndarray, ref_index: int,
-                   arw_var: np.ndarray, f: np.ndarray, *, min_conf: float, max_dev: float,
-                   bias_prior_dps: float, offset_prior_px: float, n_iter: int):
-    """Robust weighted ridge fit of ``image - gyro = a + c t`` (see :func:`register`)."""
-    sig = _sigma_from_conf(gn_c)
-    w = 1.0 / (np.where(np.isfinite(sig), sig, 1e3)[:, None] ** 2 + arw_var)
+                   arw_var: np.ndarray, f: np.ndarray, *, min_conf: float, sigma_cap: float,
+                   bias_prior_dps: float, offset_prior_px: float, n_iter: int, signif: float):
+    """Robust weighted ridge fit of ``image - gyro_seed = a + c t`` per axis.
+
+    Weights come from the image confidences with sigma capped at
+    ``sigma_cap`` (so frames with zero reported confidence still count a
+    little), then are rescaled per axis by the robust (MAD) scatter of the
+    normalized residuals whenever that exceeds 1, which self-calibrates the
+    weights when the confidences are optimistic or zero; residuals beyond 3
+    scaled sigma are clipped and the fit repeated.  The slope has a ridge
+    prior (``bias_prior_dps``) and is set to 0 unless it is at least
+    ``signif`` posterior standard deviations from 0.  Returns ``(bias (3,)
+    rad/s in omega order, a (2,) px, bias_sd_xy (2,) rad/s in (yaw, pitch)
+    = (x, y) order, offset_sd px, frames used (K,) bool)``.
+    """
+    sig = np.minimum(_sigma_from_conf(gn_c), sigma_cap)
+    w0 = 1.0 / (sig[:, None] ** 2 + arw_var)
     resid = gn_s - g0
     slope_prior = f * bias_prior_dps * _DEG
     cand = gn_c >= min_conf
     cand[ref_index] = False
     use = cand.copy()
+    scale = np.ones(2)
     a, c = np.zeros(2), np.zeros(2)
-    cov = [np.diag([offset_prior_px ** 2, s ** 2]) for s in slope_prior]
+    cov = [np.diag([offset_prior_px ** 2, sp ** 2]) for sp in slope_prior]
     for _ in range(max(1, n_iter)):
-        if not use.any():
+        if use.sum() < 3:
+            a, c = np.zeros(2), np.zeros(2)
+            cov = [np.diag([offset_prior_px ** 2, sp ** 2]) for sp in slope_prior]
             break
-        a, c, cov = _fit_bias(resid, t_rel, w, use, slope_prior, offset_prior_px)
-        dev = np.hypot(*(resid - (a[None, :] + c[None, :] * t_rel[:, None])).T)
-        tol_k = np.minimum(np.maximum(3.0 / np.sqrt(w.min(axis=1)), 0.05), max_dev)
-        new_use = cand & (dev <= tol_k)
-        if np.array_equal(new_use, use):
+        a, c, cov = _fit_bias(resid, t_rel, w0 / scale[None, :] ** 2, use, slope_prior, offset_prior_px)
+        z = (resid - (a[None, :] + c[None, :] * t_rel[:, None])) * np.sqrt(w0)
+        new_scale = np.maximum(1.0, 1.4826 * np.median(np.abs(z[use]), axis=0))
+        new_use = cand & np.all(np.abs(z) <= 3.0 * new_scale[None, :], axis=1)
+        if np.array_equal(new_use, use) and np.allclose(new_scale, scale, rtol=1e-3):
             break
-        use = new_use
+        use, scale = new_use, new_scale
+    c_sd = np.array([math.sqrt(cov[0][1, 1]), math.sqrt(cov[1][1, 1])])
+    c = np.where(np.abs(c) >= signif * c_sd, c, 0.0)
     bias = np.array([-c[1] / f[1], -c[0] / f[0], 0.0])  # (pitch, yaw, roll) rad/s
-    bias_sd = np.array([math.sqrt(cov[1][1, 1]) / f[1], math.sqrt(cov[0][1, 1]) / f[0]])
+    bias_sd_xy = c_sd / f
     offset_sd = float(math.sqrt(max(cov[0][0, 0], cov[1][0, 0])))
-    return bias, a, bias_sd, offset_sd, use
+    return bias, a, bias_sd_xy, offset_sd, use
 
 
 def _register_hybrid(capture: Capture, ref_index: int, *, time_offset: float | None = None,
                      bias: np.ndarray | None = None, min_confidence: float = 100.0,
-                     bias_min_confidence: float = 4.0, max_gyro_dev: float = 0.5,
+                     bias_min_confidence: float = 4.0, bias_sigma_cap_px: float = 1.0,
+                     bias_signif: float = 0.0, max_gyro_dev: float = 0.5,
                      tau_search: float = 0.05, tau_min_corr: float = 0.5, time_offset_prior: float = 0.0,
                      time_offset_prior_sd: float = 0.015, tau_max_sd: float = 0.003,
                      time_offset_est_sd_floor: float = 5e-4,
-                     fuse: bool = True, gyro_floor_px: float = 0.02,
+                     fuse: bool = True, gyro_floor_px: float = 0.02, fpn_correction: bool = True,
                      bias_prior_dps: float = 1.0, offset_prior_px: float = 0.5,
-                     gyro_noise_dps_rthz: float = 0.007, n_bias_iters: int = 4, fill_sigma: float = 0.7,
-                     ref_blur: float = 0.6, stack_sigma: float = 0.5, iters: int = 20,
+                     gyro_noise_dps_rthz: float = 0.007, n_bias_iters: int = 6, fill_sigma: float = 0.7,
+                     ref_blur: float = 0.6, stack_sigma: float = 0.5, iters: int = 20, tol: float = 1e-4,
+                     passes: int = 2, stack_min_conf: float = 25.0, noise_correction: bool = True,
                      max_shift: float = 4.0, noise_sigma_k: float | None = None) -> Registration:
     gyro = capture.gyro
     if gyro is None:
@@ -920,16 +1016,17 @@ def _register_hybrid(capture: Capture, ref_index: int, *, time_offset: float | N
     t_rel = t_mid - t_mid[ref_index]
     K = capture.n_subpages
     f = np.asarray(sensor.f_px)
-    nv = _noise_var(sensor, noise_sigma_k)
-    common = dict(iters=iters, tol=1e-4, max_shift=max_shift, noise_var=nv)
+    nv = _noise_var(sensor, noise_sigma_k) if noise_correction else (0.0, 0.0)
+    common = dict(iters=iters, tol=tol, max_shift=max_shift, noise_var=nv)
     info: dict = {}
 
     # 1. Time offset from image-only shifts (when not given).
     tau_source = "given"
     if time_offset is None:
         img_s, img_c, _ = _image_gn(capture, ref_index, None, fill_sigma=fill_sigma, ref_blur=ref_blur,
-                                    stack_sigma=stack_sigma, iters=iters, max_shift=max_shift,
-                                    noise_sigma_k=noise_sigma_k)
+                                    passes=passes, stack_sigma=stack_sigma, stack_min_conf=stack_min_conf,
+                                    iters=iters, tol=tol, max_shift=max_shift, noise_sigma_k=noise_sigma_k,
+                                    noise_correction=noise_correction)
         # Inverse-variance weights; the cap keeps the reference and a few
         # very confident frames from dominating.
         tau, tinfo = estimate_time_offset(img_s, windows, gyro, tau_search, sensor=sensor,
@@ -950,8 +1047,8 @@ def _register_hybrid(capture: Capture, ref_index: int, *, time_offset: float | N
     g0 = integrate_gyro(gyro, sensor, windows, tau, bias=bias)
     g0 = g0 - g0[ref_index]
     arw_var = _gyro_variance_px(capture, ref_index, gyro_noise_dps_rthz, 0.0)
-    bias_kw = dict(min_conf=bias_min_confidence, max_dev=max_gyro_dev, bias_prior_dps=bias_prior_dps,
-                   offset_prior_px=offset_prior_px, n_iter=n_bias_iters)
+    bias_kw = dict(min_conf=bias_min_confidence, sigma_cap=bias_sigma_cap_px, bias_prior_dps=bias_prior_dps,
+                   offset_prior_px=offset_prior_px, n_iter=n_bias_iters, signif=bias_signif)
 
     def corrected_gyro(gn_s: np.ndarray, gn_c: np.ndarray):
         """Bias-corrected gyro shifts and the image anchor offset ``a``.
@@ -981,13 +1078,25 @@ def _register_hybrid(capture: Capture, ref_index: int, *, time_offset: float | N
     # 4. Second pass against a multi-frame reference built with the combined shifts.
     gn_s, gn_c = _stack_pass(capture, ref_index, combined, np.ones(K), combined, stack_sigma=stack_sigma,
                              **common)
+    if fpn_correction and nv[1] > 0:
+        # 4b. The fixed pattern is sensor-locked and pulls every subpage toward
+        # the reference's alignment; estimate it, remove it and re-register.
+        g4, _, a4, _, _, _ = corrected_gyro(gn_s, gn_c)
+        s4 = gn_s - a4[None, :]
+        cur = np.where(decide(s4, gn_c, g4)[:, None], s4, g4)
+        cur[ref_index] = 0.0
+        fpn_hat, f_res = _estimate_fpn(capture.subpages, cur, sensor.shape, stack_sigma, nv)
+        corrected = [dataclasses.replace(sp, values=sp.values - fpn_hat) for sp in capture.subpages]
+        gn_s, gn_c = _stack_pass(capture, ref_index, cur, np.ones(K), cur, stack_sigma=stack_sigma,
+                                 **{**common, "noise_var": (nv[0], f_res)}, subpages=corrected)
+        info["fpn_estimate"] = fpn_hat
     # 5. Bias fit, then accept the image estimate or fall back to the corrected gyro.
-    g, gyro_bias, a, bias_sd, offset_sd, use = corrected_gyro(gn_s, gn_c)
+    g, gyro_bias, a, bias_sd_xy, offset_sd, use = corrected_gyro(gn_s, gn_c)
     img_s = gn_s - a[None, :]
     with np.errstate(divide="ignore"):
         img_c = np.where(gn_c > 0, 1.0 / (1.0 / np.maximum(gn_c, _CONF_FLOOR) + offset_sd ** 2), 0.0)
     accept = decide(img_s, gn_c, g)
-    g_var = _gyro_variance_px(capture, ref_index, gyro_noise_dps_rthz, bias_sd) + gyro_floor_px ** 2
+    g_var = _gyro_variance_px(capture, ref_index, gyro_noise_dps_rthz, bias_sd_xy) + gyro_floor_px ** 2
     if tau_sd > 0:  # time-offset uncertainty times the shift's sensitivity to tau
         d = 1e-3
         gp = integrate_gyro(gyro, sensor, windows, tau + d, bias=gyro_bias)
@@ -1010,7 +1119,7 @@ def _register_hybrid(capture: Capture, ref_index: int, *, time_offset: float | N
     fallback = ~accept
     fallback[ref_index] = False
     info.update(accepted=accept, fallback=fallback, gn_shifts=gn_s, gn_confidence=gn_c, gyro_shifts=g,
-                gyro_seed=g0, gyro_sigma_px=np.sqrt(g_var), bias_fit_frames=use, bias_sd=bias_sd,
+                gyro_seed=g0, gyro_sigma_px=np.sqrt(g_var), bias_fit_frames=use, bias_sd=bias_sd_xy[::-1],
                 image_offset_px=a, time_offset_sd=tau_sd,
                 sigma_px=_sigma_from_conf(conf))
     return Registration(shifts=shifts, confidence=conf, method="hybrid", time_offset_s=tau,
@@ -1037,17 +1146,24 @@ def register(capture: Capture, method: Literal["phase", "gn", "gyro", "hybrid"] 
     - ``"hybrid"``: ``time_offset=None`` (estimate), ``bias=None``
       (estimate), ``min_confidence=100`` (px^-2, i.e. sigma <= 0.1 px, to
       accept an image shift), ``bias_min_confidence=4`` (sigma <= 0.5 px,
-      to use a frame in the bias fit), ``max_gyro_dev=0.5`` (px),
-      ``fuse=True`` (accepted frames are the inverse-variance mean of image
-      and gyro; ``False`` uses the image shift alone, as in the plan),
-      ``tau_search=0.05``, ``tau_min_corr=0.5`` and ``tau_max_sd=0.003``
-      (the estimated tau is used only if the correlation peak and its
-      predicted standard error pass both limits; otherwise
-      ``time_offset_prior=0.0`` with ``time_offset_prior_sd=0.015``),
-      ``bias_prior_dps=1.0`` (Gaussian prior sd of the bias; shrinks the
-      fit when the images are weak), ``offset_prior_px=0.5``,
-      ``gyro_noise_dps_rthz=0.007`` and ``gyro_floor_px=0.02`` (gyro error
-      model), plus the ``"gn"`` image options.
+      to use a frame in the bias fit), ``bias_signif=0`` (zero the fitted
+      slope unless it is this many posterior sd from 0), ``max_gyro_dev=0.5``
+      (px), ``fuse=True`` (accepted frames are the inverse-variance mean of
+      image and gyro; ``False`` uses the image shift alone, as in the plan),
+      ``fpn_correction=True`` (estimate and remove the fixed pattern before
+      the final multi-frame pass), ``tau_search=0.05``, ``tau_min_corr=0.5``
+      and ``tau_max_sd=0.003`` (the estimated tau is used only if the
+      correlation peak and its predicted standard error pass both limits;
+      otherwise ``time_offset_prior=0.0`` with
+      ``time_offset_prior_sd=0.015``), ``bias_prior_dps=1.0`` (Gaussian
+      prior sd of the bias; shrinks the fit when the images are weak),
+      ``offset_prior_px=0.5``, ``gyro_noise_dps_rthz=0.007`` and
+      ``gyro_floor_px=0.02`` (gyro error model), and the image options
+      ``fill_sigma``, ``ref_blur``, ``passes`` and ``stack_min_conf`` (for
+      the image-only tau step), ``stack_sigma``, ``iters``, ``tol``,
+      ``max_shift``, ``noise_correction``.
+    - ``"phase"`` also takes ``max_shift=4.0``: peaks farther away are
+      clipped and get zero confidence.
 
     Image methods also take ``noise_sigma_k`` (default: the sensor's
     NETD-derived temporal sigma; quantization and ``fpn_sigma_k`` are added
@@ -1058,13 +1174,15 @@ def register(capture: Capture, method: Literal["phase", "gn", "gyro", "hybrid"] 
     by their confidence; (2) integrate the gyro as the seed; (3) refine
     each subpage by Gauss-Newton from the seed against the reference
     subpage; (4) fit ``image - gyro = a + c t`` per axis over the frames
-    with confidence >= ``bias_min_confidence`` (inverse-variance weights,
-    ridge prior on ``c``, iterative outlier rejection), giving the bias
-    ``-c / f`` and the image anchor offset ``a`` (the gyro is exact relative
-    to the reference, so ``a`` is removed from the image shifts); (5) build
-    a multi-frame reference from the accepted image shifts and the corrected
-    gyro shifts, re-register every subpage against it, and refit the bias;
-    (6) accept a frame's image shift when its confidence is at least
+    with confidence >= ``bias_min_confidence`` (inverse-variance weights
+    rescaled by the robust residual scatter, ridge prior on ``c``,
+    3-sigma clipping), giving the bias ``-c / f`` and the image anchor
+    offset ``a`` (the gyro is exact relative to the reference, so ``a`` is
+    removed from the image shifts); (5) build a multi-frame reference from
+    the accepted image shifts and the corrected gyro shifts and re-register
+    every subpage against it; (5b) estimate the fixed pattern from the
+    residuals, remove it and re-register once more; (6) refit the bias and
+    accept a frame's image shift when its confidence is at least
     ``min_confidence`` and it lies within ``max_gyro_dev`` of the
     bias-corrected gyro, otherwise fall back to the gyro.  The roll bias is
     not observable from translations and is reported as 0.
