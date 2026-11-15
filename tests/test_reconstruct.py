@@ -85,7 +85,9 @@ def _bar(chart_scene, f):
 def test_s1_btv_beats_baselines(s1_case, chart_scene):
     """S1: BTV-MAP at 2x beats bicubic by >= 1 dB, the registered average by
     >= 0.5 dB, and both on MTF at 0.6 cyc/LR px.  (Measured: about +4.7 dB,
-    +4.9 dB; MTF 0.28 vs 0.08 / 0.07.)"""
+    +4.8 dB; MTF 0.28 vs 0.08 / 0.08.  On this chart the registered average
+    is about as good as bicubic in PSNR, because edge blur, not noise,
+    dominates the error.)"""
     cap, s, sensor, truth = s1_case
     assert np.ptp(s[:, 0]) >= 0.5 and np.ptp(s[:, 1]) >= 0.5
     g06 = _bar(chart_scene, 0.6)
@@ -241,3 +243,29 @@ def test_reconstruct_argument_errors(s1_case):
         reconstruct(cap.subpages, s, sensor, "nope")
     with pytest.raises(ValueError):
         reconstruct(cap.subpages, s[:-1], sensor, "btv")
+
+
+def test_btv_fpn_zero_prior_skips_estimation(s1_case):
+    """With a zero FPN prior the MAP offsets are 0: estimation is skipped
+    (warned) instead of falling back to the noisy plain mean."""
+    cap, s, _, _ = s1_case
+    sensor = SensorConfig.bab(psf_sigma_px=0.4, refresh_hz=8.0, fpn_sigma_k=0.0)
+    with pytest.warns(RuntimeWarning):
+        rec = btv_map(cap.subpages, s, sensor, SCALE, estimate_fpn=True)
+    ref = btv_map(cap.subpages, s, sensor, SCALE)
+    np.testing.assert_array_equal(rec.image, ref.image)
+    assert np.all(np.nan_to_num(rec.info["fpn"]) == 0.0)
+
+
+def test_btv_noiseless_beats_bicubic():
+    """The default lam has a noise floor: noiseless, PSF-0 input still gets
+    enough regularization for the part of the null space the data cannot see
+    (target-Nyquist stripes) and beats bicubic."""
+    scene = make_scene("textured", contrast_k=2.0, seed=7)
+    sensor = SensorConfig.bab(netd_1hz_k=0.0, fpn_sigma_k=0.0, adc_lsb_k=0.0, psf_sigma_px=0.0)
+    s = _shifts(0)
+    cap = _capture(scene, sensor, s, seed=100)
+    truth = truth_at_scale(cap, SCALE)
+    p_bic = psnr(reconstruct(cap.subpages, s, sensor, "bicubic").image, truth, border=BORDER)
+    p_btv = psnr(reconstruct(cap.subpages, s, sensor, "btv").image, truth, border=BORDER)
+    assert p_btv > p_bic + 1.0, (p_btv, p_bic)

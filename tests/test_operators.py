@@ -114,10 +114,13 @@ def test_axis_weights_match_numerical_box_gauss_integral():
     def kernel(x):  # box [a, a+1) convolved with N(0, sigma^2)
         return ndtr((x - left[0]) / sigma) - ndtr((x - left[0] - 1.0) / sigma)
 
-    ref = np.array([integrate.quad(kernel, v / scale, (v + 1) / scale)[0] for v in range(n)])
-    ref[np.abs(np.arange(n) / scale - left[0] - 0.5) > 0.5 + 3 * sigma + 1 / scale] = 0.0
+    ref = np.array([integrate.quad(kernel, v / scale, (v + 1) / scale, epsabs=1e-13)[0]
+                    for v in range(n)])
+    # Same truncation rule as the operator: keep cells intersecting the box +/- 3 sigma.
+    lo, hi = np.arange(n) / scale, (np.arange(n) + 1) / scale
+    ref[~((hi > left[0] - 3 * sigma) & (lo < left[0] + 1 + 3 * sigma))] = 0.0
     ref /= ref.sum()
-    np.testing.assert_allclose(w, ref, atol=2e-4)  # 3-sigma truncation + renormalization
+    np.testing.assert_allclose(w, ref, atol=1e-10)
     assert np.isclose(w.sum(), 1.0)
     # Centroid of the weights sits at the footprint center.
     centers = (np.arange(n) + 0.5) / scale
@@ -127,14 +130,24 @@ def test_axis_weights_match_numerical_box_gauss_integral():
 def test_grid_alignment_exact_with_half_pixel_shifts(chart, clean_bab):
     """Grid alignment and sign convention: with PSF 0 and shifts that are
     multiples of 1/s, each LR footprint is exactly a union of target cells, so
-    A @ truth_at_scale(capture, s) reproduces the noiseless samples."""
+    A @ truth_at_scale(capture, s) reproduces the noiseless samples.  Only
+    samples whose footprint lies inside the target grid are compared (the
+    operator folds off-grid mass into border cells, the simulator samples the
+    real margin)."""
     s = np.array([[0.0, 0.0], [0.0, 0.0], [0.5, -0.5], [0.5, -0.5], [-1.5, 1.0], [-1.5, 1.0]])
     cap = _capture(chart, clean_bab, s)
+    truth = truth_at_scale(cap, 2).ravel()
+    inside = []
+    for (dx, dy), idx in zip(s, valid_samples(cap.subpages)):
+        i, j = np.divmod(idx, 32)
+        inside.append((j + dx >= 0) & (j + 1 + dx <= 32) & (i + dy >= 0) & (i + 1 + dy <= 24))
+    inside = np.concatenate(inside)
+    assert inside.mean() > 0.85
     A, y = build_operator(cap.subpages, s, clean_bab, 2, psf_sigma=0.0)
-    np.testing.assert_allclose(A @ truth_at_scale(cap, 2).ravel(), y, atol=1e-9)
+    np.testing.assert_allclose((A @ truth)[inside], y[inside], atol=1e-9)
     # A sign error in the shift would break it.
     A_bad, _ = build_operator(cap.subpages, -s, clean_bab, 2, psf_sigma=0.0)
-    assert np.max(np.abs(A_bad @ truth_at_scale(cap, 2).ravel() - y)) > 1.0
+    assert np.max(np.abs((A_bad @ truth - y)[inside])) > 1.0
 
 
 def test_operator_predicts_blurred_capture(chart):

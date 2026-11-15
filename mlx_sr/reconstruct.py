@@ -39,6 +39,7 @@ or :mod:`mlx_sr.scene` (inverse-crime separation).
 from __future__ import annotations
 
 import time
+import warnings
 from typing import Literal
 
 import numpy as np
@@ -225,7 +226,7 @@ def baseline_bicubic(subpages: list[Subpage], sensor: SensorConfig, scale: int =
 
 
 def baseline_average(subpages: list[Subpage], shifts: np.ndarray, sensor: SensorConfig,
-                     scale: int = 2, sigma: float = 0.25) -> Reconstruction:
+                     scale: int = 2, sigma: float = 0.2) -> Reconstruction:
     """Registered average, then bicubic upsampling (denoising-only baseline).
 
     Every valid sample is placed at its registered position on the reference
@@ -235,7 +236,11 @@ def baseline_average(subpages: list[Subpage], shifts: np.ndarray, sensor: Sensor
     upsampled with Keys bicubic, so the result has the noise reduction of
     multi-frame averaging but no resolution beyond the LR grid.  (A
     fill-then-cubic-warp variant was measured about 0.8 dB worse on the chart,
-    so this is the stronger, fairer baseline.)
+    so this is the stronger, fairer baseline.)  ``sigma=0.2`` LR px: smaller
+    values gain ~0.1 dB but leave more pixels uncovered at small K; with
+    asymmetric shifts the Gaussian weighting can bias positions by up to
+    ~0.1 LR px.  LR pixels with no sample within 3 sigma are filled from
+    their neighbors.
     """
     shifts = _check_inputs(subpages, shifts)
     lr_rec = normalized_convolution(subpages, shifts, sensor, 1, sigma=sigma)
@@ -352,9 +357,11 @@ def ibp(subpages: list[Subpage], shifts: np.ndarray, sensor: SensorConfig, scale
 
 
 def btv_offsets(p: int, alpha: float) -> list[tuple[int, int, float]]:
-    """Farsiu BTV shift set ``(dy, dx, alpha^(|dy|+|dx|))``, each unordered
-    pair of neighbors once: ``dy in [0, p]``, ``dx in [-p, p]``, excluding
-    ``(0, 0)`` and ``(0, dx < 0)``."""
+    """BTV shift set ``(dy, dx, alpha^(|dy|+|dx|))``: every unordered pair of
+    neighbors in the ``(2p+1)^2`` window exactly once (``dy in [0, p]``,
+    ``dx in [-p, p]``, excluding ``(0, dx <= 0)``).  This is the full
+    half-window, slightly more isotropic than Farsiu's ``l + m >= 0`` index
+    set (which omits e.g. ``(1, -2)``); the decay ``alpha^(|l|+|m|)`` is his."""
     out = []
     for dy in range(0, p + 1):
         for dx in range(-p, p + 1):
@@ -427,34 +434,48 @@ DEFAULT_EPS_DATA_PER_K: float = 0.4
 DEFAULT_EPS_BTV_K: float = 0.2
 """Default BTV Charbonnier epsilon in kelvin (scene-difference scale)."""
 
+NOISE_FLOOR_K: float = 0.25
+"""Lower bound of :func:`noise_scale`, so the default ``lam`` never vanishes."""
+
 
 def noise_scale(sensor: SensorConfig) -> float:
-    """Per-sample error scale ``max(sqrt(noise_sigma_k^2 + fpn_sigma_k^2), 0.05)`` K."""
-    return max(float(np.hypot(sensor.noise_sigma_k, sensor.fpn_sigma_k)), 0.05)
+    """Per-sample error scale ``max(sqrt(noise_sigma_k^2 + fpn_sigma_k^2), NOISE_FLOOR_K)`` K."""
+    return max(float(np.hypot(sensor.noise_sigma_k, sensor.fpn_sigma_k)), NOISE_FLOOR_K)
 
 
-def default_btv_params(sensor: SensorConfig) -> dict:
+def default_btv_params(sensor: SensorConfig, scale: int = 2) -> dict:
     """Default ``lam``, ``eps_charbonnier`` and ``eps_btv`` for :func:`btv_map`.
 
-    ``lam = 0.042 sigma``, ``eps_charbonnier = 0.4 sigma`` and
-    ``eps_btv = 0.2`` K, with ``sigma`` = :func:`noise_scale`.  Tuned on the
-    BAB chart (PSF 0.4 px, 2x, K = 16, 8 Hz, sigma = 0.71 K: lam = 0.030,
-    eps = 0.29 K) as a balance between PSNR, which is flat within about
-    0.1 dB over lam = 0.03-0.06, and contrast above native Nyquist, which
-    drops quickly with lam.  Scaling with sigma keeps BTV ahead of both
-    baselines from 2 Hz (sigma 0.37 K) to 32 Hz (sigma 1.42 K).
+    ``lam = 0.042 sigma (2 / scale)^2``, ``eps_charbonnier = 0.4 sigma`` and
+    ``eps_btv = 0.2`` K, with ``sigma`` = :func:`noise_scale`.
+
+    - Tuned on the BAB chart (PSF 0.4 px, 2x, K = 16, 8 Hz, sigma = 0.71 K:
+      lam = 0.030, eps = 0.29 K) as a balance between PSNR, which is flat
+      within about 0.1 dB over lam = 0.03-0.06, and contrast above native
+      Nyquist, which drops quickly with lam.
+    - Scaling with sigma kept BTV ahead of both baselines on the chart from
+      2 Hz (sigma 0.37 K) to 32 Hz (sigma 1.42 K).
+    - The ``NOISE_FLOOR_K = 0.25`` floor keeps the part of the null space of
+      ``A`` that the data cannot see (e.g. target-Nyquist stripes) regularized
+      for (nearly) noiseless input: with a 0.05 K floor a noiseless PSF-0
+      textured scene came out worse than bicubic.
+    - The ``(2 / scale)^2`` factor: at 3x, ``lam / 2.25`` gave +0.4 dB and
+      3x the bar contrast at 0.6 cyc/LR px on the chart.
+    - Not universal: on the low-contrast (2 K) textured scene at 8 Hz BTV
+      only ties the registered average at best; tune ``lam`` per scene class
+      when that matters.
     """
     sig = noise_scale(sensor)
-    return dict(lam=DEFAULT_LAM_PER_K * sig, eps_charbonnier=DEFAULT_EPS_DATA_PER_K * sig,
-                eps_btv=DEFAULT_EPS_BTV_K)
+    return dict(lam=DEFAULT_LAM_PER_K * sig * (2.0 / scale) ** 2,
+                eps_charbonnier=DEFAULT_EPS_DATA_PER_K * sig, eps_btv=DEFAULT_EPS_BTV_K)
 
 
 def btv_map(subpages: list[Subpage], shifts: np.ndarray, sensor: SensorConfig, scale: int = 2,
             lam: float | None = None, alpha: float = 0.7, p: int = 2,
             eps_charbonnier: float | None = None, init: str | np.ndarray = "nc",
             estimate_fpn: bool = False, n_outer: int = 3, psf_sigma: float | None = None,
-            maxiter: int = 400, eps_btv: float | None = None, fpn_shrink: bool = FPN_SHRINK
-            ) -> Reconstruction:
+            maxiter: int = 400, eps_btv: float | None = None, fpn_shrink: bool = FPN_SHRINK,
+            fpn_sigma_prior: float | None = None) -> Reconstruction:
     """Robust MAP super-resolution (Farsiu et al. 2004).
 
     Minimizes ``sum_r rho_d(A x + b[pix(r)] - y)_r + lam * BTV(x)`` with
@@ -470,12 +491,17 @@ def btv_map(subpages: list[Subpage], shifts: np.ndarray, sensor: SensorConfig, s
     ``estimate_fpn=True`` alternates ``n_outer`` solves for ``x`` with an
     update of the per-LR-pixel offsets ``b``: the masked mean residual of each
     pixel, minus the mean over all read pixels (zero-mean constraint, which
-    removes the offset ambiguity between ``b`` and ``x``).  With
+    removes the offset ambiguity between ``b`` and ``x``; ``A``'s rows sum
+    to 1).  With
     ``fpn_shrink=True`` (default) the mean is the MAP estimate under a
-    Gaussian prior ``b ~ N(0, fpn_sigma_k^2)``:
-    ``b = sum_k r_k / (n + (noise_sigma_k / fpn_sigma_k)^2)``.  With only
-    ``n = K/2`` reads per pixel the plain mean (``fpn_shrink=False``, or
-    ``fpn_sigma_k == 0``) mostly estimates temporal noise: on the BAB chart at
+    Gaussian prior ``b ~ N(0, sf^2)``:
+    ``b = sum_k r_k / (n + (noise_sigma_k / sf)^2)`` where ``sf`` is
+    ``fpn_sigma_prior`` (default ``sensor.fpn_sigma_k``, i.e. the assumed
+    residual FPN after calibration).  With ``sf == 0`` the MAP estimate is
+    ``b = 0``, so FPN estimation is skipped (with a warning).  This is a
+    deliberate refinement of the plain masked mean: with only
+    ``n = K/2`` reads per pixel the plain mean (``fpn_shrink=False``) mostly
+    estimates temporal noise: on the BAB chart at
     8 Hz, K = 16, FPN 0.2 K its offset error was 0.27-0.37 K (worse than not
     estimating) and grew with ``n_outer``, while the shrunk update gave
     0.17 K and lowered the flat-region sigma for every tested seed.  The offsets
@@ -486,7 +512,7 @@ def btv_map(subpages: list[Subpage], shifts: np.ndarray, sensor: SensorConfig, s
     A, y = build_operator(subpages, shifts, sensor, scale, psf_sigma)
     AT = A.T.tocsr()
     H, W = sensor.shape[0] * scale, sensor.shape[1] * scale
-    dflt = default_btv_params(sensor)
+    dflt = default_btv_params(sensor, scale)
     lam = dflt["lam"] if lam is None else float(lam)
     eps_d = dflt["eps_charbonnier"] if eps_charbonnier is None else float(eps_charbonnier)
     eps_b = dflt["eps_btv"] if eps_btv is None else float(eps_btv)
@@ -500,8 +526,15 @@ def btv_map(subpages: list[Subpage], shifts: np.ndarray, sensor: SensorConfig, s
     seen = counts > 0
     b = np.zeros(npix)
     shrink = 0.0
-    if fpn_shrink and sensor.fpn_sigma_k > 0:
-        shrink = (sensor.noise_sigma_k / sensor.fpn_sigma_k) ** 2
+    fpn_requested = estimate_fpn
+    if estimate_fpn and fpn_shrink:
+        sf = float(sensor.fpn_sigma_k if fpn_sigma_prior is None else fpn_sigma_prior)
+        if sf <= 0.0:
+            warnings.warn("estimate_fpn with a zero FPN prior: the MAP offsets are 0, skipping "
+                          "FPN estimation", RuntimeWarning, stacklevel=2)
+            estimate_fpn = False
+        else:
+            shrink = (sensor.noise_sigma_k / sf) ** 2
 
     def fun(xv: np.ndarray, yc: np.ndarray) -> tuple[float, np.ndarray]:
         return map_objective(xv, A, yc, (H, W), lam, alpha, p, eps_d, eps_b, AT=AT)
@@ -521,7 +554,7 @@ def btv_map(subpages: list[Subpage], shifts: np.ndarray, sensor: SensorConfig, s
     info = dict(lam=lam, alpha=alpha, p=p, eps_charbonnier=eps_d, eps_btv=eps_b,
                 psf_sigma=float(sensor.psf_sigma_px if psf_sigma is None else psf_sigma),
                 history=history, estimate_fpn=estimate_fpn, init=init if isinstance(init, str) else "array")
-    if estimate_fpn:
+    if fpn_requested:
         info["fpn"] = np.where(seen, b, np.nan).reshape(sensor.shape)
     colsum = np.asarray(A.sum(axis=0)).ravel().reshape(H, W)
     return Reconstruction(image=x.reshape(H, W), certainty=colsum, scale=scale, method="btv", info=info)
