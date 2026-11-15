@@ -19,8 +19,8 @@ Reconstructions compared (keys of ``result["metrics"]``)
 ``"average"``
     Registered average at the native grid, then bicubic: multi-frame
     *denoising* with no resolution beyond the LR grid.  The gap between the
-    method and this baseline is the part of the gain that is true
-    super-resolution rather than noise averaging.
+    method and this baseline is *not* all super-resolution: it also holds
+    the method's prior and PSF deconvolution (see the still twin below).
 ``"nc"``, ``"ibp"``, ``"btv"``
     Multi-frame reconstructions on the estimated shifts.
 ``"<name>@true"``
@@ -32,10 +32,20 @@ Reconstructions compared (keys of ``result["metrics"]``)
     realization and fixed pattern, but no motion at all (so no sub-pixel
     diversity; zero shifts).  Whatever the method gains on the still twin
     comes from its prior, deconvolution and noise averaging, not from
-    super-resolution.  The gap ``method - method@still`` is the part of the
-    gain that the motion itself buys.  This control matters for BTV: its
+    super-resolution.  The gap ``method - method@still`` is the total effect
+    of the motion (within-exposure blur or jitter plus sub-pixel spread, and
+    fixed-pattern decorrelation).  This control matters for BTV: its
     edge-preserving prior sharpens the chart's step edges (raising the
     slanted-edge MTF50 well above the bicubic baseline) even with no motion.
+``"<method>@nospread"`` (``run_case(nospread_control=True)`` only)
+    The method on a *no-spread twin*: same seed, noise and fixed pattern,
+    and the same motion *within* each exposure, but with each subpage's
+    mean pose removed (:func:`nospread_trace`), so there is no sub-pixel
+    spread between subpages.  ``method - method@nospread`` isolates the
+    effect of the spread, the only part that can be super-resolution.  PSNR
+    alone can still rise for reasons other than SR (e.g. blur that happens
+    to suit the prior), so read it together with the high-band fidelity
+    difference.
 
 Grids
 -----
@@ -53,8 +63,10 @@ Metrics (per reconstruction)
 ``data_range`` (the truth's range) and a border of ``2 s`` target px;
 ``rmse_k``; ``hf_fidelity`` (:func:`mlx_sr.metrics.highband_fidelity`: 1 = the
 detail above native Nyquist recovered exactly, 0 = none, negative = wrong
-detail; the most direct super-resolution measure here; NaN when the truth
-has less than ``HF_MIN_RMS_K`` of such detail); ``mtf50`` and ``mtf_at_0.6`` / ``mtf_at_0.75`` (slanted edge,
+detail; a prior that suits the scene already scores above 0 with no motion,
+so it is meaningful only as a difference between reconstructions, e.g.
+against the still or no-spread twin; NaN when the truth has less than
+``HF_MIN_RMS_K`` of such detail); ``mtf50`` and ``mtf_at_0.6`` / ``mtf_at_0.75`` (slanted edge,
 cycles per LR px; native Nyquist 0.5) and ``mtf_valid``; ``bar_limit_freq``
 (highest resolvable bar group, cycles per LR px; NaN when none) and
 ``bar_contrast_<f>`` per group; ``hotspot_err_k`` per hot spot (signed peak
@@ -72,7 +84,11 @@ average, ``bar_ratio`` = ``bar_limit_freq[method] / bar_limit_freq[bicubic]``,
 ``motion_gain_db`` = ``psnr[method] - psnr[method@still]``,
 ``motion_mtf_ratio`` = ``mtf50[method] / mtf50[method@still]`` and
 ``motion_bar_ratio`` likewise for the bar limit and ``motion_hf_gain`` =
-``hf_fidelity[method] - hf_fidelity[method@still]``.
+``hf_fidelity[method] - hf_fidelity[method@still]``.  With the no-spread
+control: ``spread_gain_db`` = ``psnr[method] - psnr[method@nospread]``,
+``spread_hf_gain`` likewise for ``hf_fidelity``, ``nospread_residual_px``
+(the twin's remaining spread) and, with both controls,
+``within_exposure_db`` / ``within_exposure_hf`` = no-spread minus still.
 """
 
 from __future__ import annotations
@@ -87,10 +103,10 @@ from .motion import angles_to_shift
 from .reconstruct import reconstruct
 from .registration import CONF_REF, register
 from .sensor import simulate_capture, truth_at_scale
-from .types import Capture, GyroConfig, MotionConfig, Registration, Scene, SensorConfig
+from .types import Capture, GyroConfig, MotionConfig, MotionTrace, Registration, Scene, SensorConfig
 
 __all__ = ["run_pipeline", "run_case", "evaluate_image", "infer_ref_index", "flatten_result",
-           "truth_highband_rms", "motion_diagnostics", "DEFAULT_BASELINES", "MTF_FREQS", "HF_MIN_RMS_K"]
+           "truth_highband_rms", "motion_diagnostics", "nospread_trace", "DEFAULT_BASELINES", "MTF_FREQS", "HF_MIN_RMS_K"]
 
 DEFAULT_BASELINES: tuple[str, ...] = ("bicubic", "average", "nc")
 """Baselines computed alongside the method (``"ibp"`` is available but slower)."""
@@ -334,7 +350,7 @@ def run_case(scene: Scene, sensor: SensorConfig, motion_cfg: MotionConfig | None
              gyro_cfg: GyroConfig | None, n_frames: int, seed: int, *,
              reg_method: str | None = None, method: str = "btv", scale: int = 2,
              ref_index: int = 0, reg_kw: dict | None = None, still_control: bool | Iterable[str] = False,
-             **pipeline_kw) -> dict[str, Any]:
+             nospread_control: bool | Iterable[str] = False, **pipeline_kw) -> dict[str, Any]:
     """Simulate a capture, register it and run :func:`run_pipeline`.
 
     ``reg_method`` defaults to ``"hybrid"`` when a gyro is simulated and
@@ -343,6 +359,10 @@ def run_case(scene: Scene, sensor: SensorConfig, motion_cfg: MotionConfig | None
     also reconstructs a still twin (see the module docstring) and adds
     ``metrics["<method>@still"]`` and the ``motion_*`` summary values; an
     iterable of method names runs each of them on the twin.
+    ``nospread_control`` likewise adds a no-spread twin
+    (:func:`nospread_trace`: the same within-exposure motion with the
+    subpage-to-subpage motion removed), ``metrics["<method>@nospread"]``
+    and the ``spread_*`` / ``within_exposure_*`` summary values.
     """
     t0 = time.perf_counter()
     cap = simulate_capture(scene, sensor, motion_cfg, gyro_cfg, n_frames, seed)
@@ -375,12 +395,61 @@ def run_case(scene: Scene, sensor: SensorConfig, motion_cfg: MotionConfig | None
         res["motion_mtf_ratio"] = _ratio(m["mtf50"], m_still["mtf50"])
         res["motion_bar_ratio"] = _ratio(m["bar_limit_freq"], m_still["bar_limit_freq"])
         res["motion_hf_gain"] = float(m["hf_fidelity"] - m_still["hf_fidelity"])
+    if nospread_control:
+        names = [method] if nospread_control is True else list(nospread_control)
+        if method not in names:
+            names.insert(0, method)
+        twin = simulate_capture(scene, sensor, nospread_trace(cap), None, n_frames, seed)
+        ctl = run_pipeline(twin, None, method, scale, ref_index=ref_index, baselines=(),
+                           oracle=names, recon_kw=pipeline_kw.get("recon_kw"),
+                           keep_images=pipeline_kw.get("keep_images", False))
+        for nm in names:
+            res["metrics"][f"{nm}@nospread"] = ctl["metrics"][f"{nm}@true"]
+            res["timings"][f"{nm}@nospread"] = ctl["metrics"][f"{nm}@true"]["runtime_s"]
+            if "reconstructions" in res:
+                res["reconstructions"][f"{nm}@nospread"] = ctl["reconstructions"][f"{nm}@true"]
+        m, m_ns = res["metrics"][method], res["metrics"][f"{method}@nospread"]
+        res["nospread_residual_px"] = ctl["shift_spread_px"]
+        res["spread_gain_db"] = float(m["psnr"] - m_ns["psnr"])
+        res["spread_hf_gain"] = float(m["hf_fidelity"] - m_ns["hf_fidelity"])
+        if f"{method}@still" in res["metrics"]:
+            m_st = res["metrics"][f"{method}@still"]
+            res["within_exposure_db"] = float(m_ns["psnr"] - m_st["psnr"])
+            res["within_exposure_hf"] = float(m_ns["hf_fidelity"] - m_st["hf_fidelity"])
     return res
+
+
+def nospread_trace(capture: Capture, samples_per_subpage: int = 500) -> MotionTrace:
+    """Motion of ``capture`` with the subpage-to-subpage motion removed.
+
+    Within every subpage window the true angles (and roll) are kept but
+    their mean over the window is subtracted, so a capture simulated with
+    this trace has the same within-exposure motion (blur under the
+    ``"full"`` exposure model, per-pixel jitter under ``"staggered"``) but
+    essentially zero sub-pixel spread between subpages (residual: the
+    second-order ``tan`` nonlinearity).  It separates the effect of
+    within-exposure motion from the effect of inter-subpage spread.
+    """
+    ts, th, rl = [], [], []
+    has_roll = capture.motion.roll is not None
+    eps = 1e-9
+    for sp in capture.subpages:
+        mid = sp.t_start + (np.arange(samples_per_subpage) + 0.5) / samples_per_subpage * (sp.t_end - sp.t_start)
+        t = np.concatenate([[sp.t_start + eps], mid, [sp.t_end - eps]])
+        theta = capture.motion.theta_at(t)
+        th.append(theta - theta[1:-1].mean(axis=0))
+        if has_roll:
+            r = capture.motion.roll_at(t)
+            rl.append(r - r[1:-1].mean())
+        ts.append(t)
+    return MotionTrace(t=np.concatenate(ts), theta=np.concatenate(th),
+                       roll=np.concatenate(rl) if has_roll else None)
 
 
 _SUMMARY_KEYS = ("effective_gain", "effective_gain_vs_average", "bar_ratio", "psnr_gain_db",
                  "psnr_gain_vs_average_db", "hf_gain", "oracle_gap_db", "motion_gain_db",
-                 "motion_mtf_ratio", "motion_bar_ratio", "motion_hf_gain")
+                 "motion_mtf_ratio", "motion_bar_ratio", "motion_hf_gain", "spread_gain_db",
+                 "spread_hf_gain", "within_exposure_db", "within_exposure_hf", "nospread_residual_px")
 
 
 def flatten_result(res: dict[str, Any]) -> dict[str, Any]:

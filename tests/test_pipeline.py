@@ -65,7 +65,9 @@ def test_p1_tiny_tremor_report_is_complete(chart):
 
 def test_p2_deliberate_wobble_beats_bicubic(chart):
     """P2: deliberate wobble (+/-2 deg, BAB, gyro-hybrid registration): BTV
-    beats the bicubic baseline on PSNR."""
+    beats the bicubic baseline on PSNR.  This includes BTV's prior gain (it
+    also beats bicubic on a still capture); the super-resolution part is
+    tested by :func:`test_p2_wobble_gain_requires_motion`."""
     for seed in (11, 12):
         res = run_case(chart, SensorConfig.bab(), MotionConfig.wobble(2.0, 1.0), GyroConfig(), 8,
                        seed=seed, reg_method="hybrid", baselines=("bicubic", "average"), oracle=False)
@@ -73,6 +75,39 @@ def test_p2_deliberate_wobble_beats_bicubic(chart):
         assert m["btv"]["psnr"] > m["bicubic"]["psnr"] + 1.0, seed
         assert res["psnr_gain_db"] > 1.0
         assert res["registration"]["rms_px"] < 0.2
+
+
+def test_p2_wobble_gain_requires_motion(chart):
+    """P2, paired controls: BAA, +/-2 deg wobble at 1 Hz.  BTV beats its
+    still twin (same noise, no motion) on PSNR and on high-band fidelity,
+    and the HF gain survives against the no-spread twin (same within-
+    exposure motion, no subpage-to-subpage spread), so it comes from the
+    sub-pixel spread.  (Measured for seeds 11-12: +2.1 to +2.7 dB, HF
+    +0.36 to +0.46.)"""
+    for seed in (11, 12):
+        res = run_case(chart, SensorConfig.baa(), MotionConfig.wobble(2.0, 1.0), GyroConfig(), 8,
+                       seed=seed, baselines=("bicubic",), oracle=False, still_control=True,
+                       nospread_control=True)
+        assert res["motion_gain_db"] > 1.0, (seed, res["motion_gain_db"])
+        assert res["motion_hf_gain"] > 0.15, (seed, res["motion_hf_gain"])
+        assert res["spread_hf_gain"] > 0.15, (seed, res["spread_hf_gain"])
+        assert res["nospread_residual_px"] < 0.01
+
+
+def test_nospread_twin_keeps_within_exposure_motion(chart):
+    """The no-spread trace keeps the motion inside every exposure (same
+    blur) and removes the subpage-to-subpage motion."""
+    from mlx_sr.pipeline import motion_diagnostics, nospread_trace
+
+    for exposure in ("full", "staggered"):
+        sensor = SensorConfig.bab(exposure=exposure)
+        cap = simulate_capture(chart, sensor, MotionConfig.wobble(2.0, 1.0), None, 4, seed=4)
+        twin = simulate_capture(chart, sensor, nospread_trace(cap), None, 4, seed=4)
+        d, d0 = motion_diagnostics(cap), motion_diagnostics(twin)
+        assert d["shift_spread_px"] > 0.5
+        assert d0["shift_spread_px"] < 0.01
+        assert d0["intra_blur_px"] == pytest.approx(d["intra_blur_px"], rel=0.02)
+        np.testing.assert_array_equal(twin.fpn, cap.fpn)
 
 
 def test_pipeline_grids_and_oracle_consistency(chart):

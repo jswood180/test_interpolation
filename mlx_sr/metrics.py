@@ -195,10 +195,16 @@ def highband_fidelity(img: np.ndarray, ref: np.ndarray, scale: int, *, f_cut: fl
     0 means none was recovered (e.g. any interpolation of LR data, up to
     its small spectral leakage), and a negative value means the image put
     *wrong* energy there (noise, ringing or hallucinated/aliased detail).
-    Unlike MTF50 or bar resolvability, it cannot be raised by a prior that
-    merely sharpens edges or by aliased patterns at the wrong position,
-    because the error is measured against the truth's phase.  NaN if either
-    image has a non-finite pixel or ``ref`` has no high-band energy.
+    Because the error is measured against the truth's phase, aliased or
+    misplaced detail lowers it.  It is *not* immune to priors: a prior that
+    matches the scene class (e.g. an edge-preserving prior on piecewise-
+    constant scenes) can place correct high-band energy without any
+    sub-pixel information (BTV on a still capture scores about 0.13 on the
+    chart and 0.65 on the people scene).  Use it as a *difference* between
+    reconstructions of the same scene, e.g. against a reconstruction of a
+    still or no-spread twin (:func:`mlx_sr.pipeline.run_case`), not as an
+    absolute measure of super-resolution.  NaN if either image has a
+    non-finite pixel or ``ref`` has no high-band energy.
     """
     if scale < 2:
         raise ValueError("highband_fidelity needs a grid of scale >= 2")
